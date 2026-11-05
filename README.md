@@ -1,5 +1,8 @@
 # promptsync
 
+[![ci](https://github.com/OnePotatoOne/promptsync/actions/workflows/ci.yml/badge.svg)](https://github.com/OnePotatoOne/promptsync/actions/workflows/ci.yml)
+[![release](https://github.com/OnePotatoOne/promptsync/actions/workflows/release.yml/badge.svg)](https://github.com/OnePotatoOne/promptsync/actions/workflows/release.yml)
+
 在多台电脑之间**加密同步 prompt**（默认同步 Cindy 的 `system_prompt.md` / `SOUL.md`，也可配置任意 Markdown 目录）。
 
 - **服务端（server）** 是唯一权威源：本地 prompt 一变，就重新计算 SHA-256 并递增 epoch。
@@ -432,6 +435,13 @@ tail -f ~/workspace/promptSync/config/logs/agent.log
 |---|---|---|
 | `.github/workflows/ci.yml` | push / PR | 秘密扫描、`cargo fmt --check`、`clippy -D warnings`、`cargo test` |
 | `.github/workflows/release.yml` | tag `v*` / 手动 | 交叉编译 x86_64 安装包并发布 |
+
+发一个新版本：
+
+```bash
+git tag -a v0.1.0 -m "promptsync v0.1.0"
+git push origin v0.1.0
+```
 
 release 矩阵（全部 x86_64）：`x86_64-unknown-linux-gnu`、`x86_64-unknown-linux-musl`（静态，适合 Alpine/最小镜像）、`x86_64-apple-darwin`（Intel Mac）、`x86_64-pc-windows-msvc`。产物含二进制、README、`templates/`、服务模板与 `SHA256SUMS`。
 
