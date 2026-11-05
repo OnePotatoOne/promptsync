@@ -342,7 +342,7 @@ fn qr_art(link: &str) -> Option<String> {
     )
 }
 
-fn print_qr(link: &str) {
+pub fn print_qr(link: &str) {
     match qr_art(link) {
         Some(art) => println!("{art}\n"),
         None => println!("（二维码生成失败，请直接使用上面的链接）\n"),
@@ -376,12 +376,28 @@ fn discover_p2p_binding(client: &FeishuClient) -> Result<Option<Binding>> {
 pub async fn run(
     config: Config,
     data_dir: PathBuf,
+    config_file: PathBuf,
     target: TargetFile,
-    binding: Binding,
+    binding: Option<Binding>,
     logger: Logger,
 ) -> Result<()> {
     let client = Arc::new(FeishuClient::from_config(&config)?);
-    let poll = Duration::from_secs(config.feishu.control.poll_secs.max(2));
+    let poll_secs = config.feishu.control.poll_secs.max(2);
+    let binding = match binding {
+        Some(binding) => binding,
+        None => {
+            bind_loop(
+                &config,
+                &client,
+                &data_dir,
+                &config_file,
+                poll_secs,
+                &logger,
+            )
+            .await?
+        }
+    };
+    let poll = Duration::from_secs(poll_secs);
     let mut cursor = Cursor::load(&data_dir, (binding.bound_unix + 2) * 1000);
 
     loop {
@@ -415,6 +431,79 @@ pub async fn run(
     }
 }
 
+/// Wait for the first private message (or for a configured owner to accept a
+/// hello) and persist the binding. Runs until it succeeds, so enabling Feishu
+/// without finishing the wizard still starts working after one message.
+async fn bind_loop(
+    config: &Config,
+    client: &Arc<FeishuClient>,
+    data_dir: &Path,
+    config_file: &Path,
+    poll_secs: u64,
+    logger: &Logger,
+) -> Result<Binding> {
+    logger.info("Feishu: 尚未绑定，正在等待你在飞书里给机器人发一条私聊消息（发一次即可自动绑定）");
+    let mut last_error: Option<String> = None;
+    loop {
+        let config = config.clone();
+        let client_for_task = Arc::clone(client);
+        let attempt =
+            tokio::task::spawn_blocking(move || try_bind_once(&config, &client_for_task)).await;
+        match attempt {
+            Ok(Ok(Some(binding))) => {
+                save_binding(data_dir, &binding)?;
+                let _ = set_value(
+                    config_file,
+                    Some("feishu.app"),
+                    "owner_open_id",
+                    &format!("\"{}\"", binding.open_id),
+                );
+                let _ = client.send_text_to_chat(
+                    &binding.chat_id,
+                    "promptsync 绑定成功。以后直接把纯文本 prompt 发给我，我会覆盖服务端的那个文件。",
+                );
+                logger.info(format!(
+                    "Feishu bound: chat {} owner {}",
+                    binding.chat_id, binding.open_id
+                ));
+                return Ok(binding);
+            }
+            Ok(Ok(None)) => {
+                last_error = None;
+            }
+            Ok(Err(err)) => {
+                let message = format!("{err:#}");
+                if last_error.as_deref() != Some(&message) {
+                    logger.warn(format!(
+                        "Feishu binding attempt failed (will keep trying): {message}"
+                    ));
+                    last_error = Some(message);
+                }
+            }
+            Err(err) => logger.warn(format!("Feishu binding task panicked: {err}")),
+        }
+        tokio::time::sleep(Duration::from_secs(poll_secs)).await;
+    }
+}
+
+/// One binding attempt: a configured owner is pinged directly; otherwise we
+/// look for an existing p2p chat that already contains a user message.
+fn try_bind_once(config: &Config, client: &FeishuClient) -> Result<Option<Binding>> {
+    let owner = config.feishu.app.owner_open_id.trim();
+    if !owner.is_empty() {
+        let sent = client.send_text_to_owner(
+            owner,
+            "promptsync 已就绪，之后直接在这个私聊里发纯文本即可。",
+        )?;
+        return Ok(Some(Binding {
+            chat_id: sent.chat_id,
+            open_id: owner.to_string(),
+            bound_unix: now_unix(),
+        }));
+    }
+    discover_p2p_binding(client)
+}
+
 struct PollOutcome {
     cursor: Cursor,
     log_message: Option<String>,
@@ -435,6 +524,12 @@ fn poll_once(
 
     for message in messages {
         if cursor.seen(&message.id) {
+            continue;
+        }
+        // Never treat messages that predate the binding (including the one
+        // that triggered it) as prompt content.
+        if message.create_time_ms / 1000 <= binding.bound_unix {
+            cursor.record(&message.id, message.create_time_ms);
             continue;
         }
         if message.chat_id != binding.chat_id || message.sender_type != "user" {
@@ -751,7 +846,8 @@ mod tests {
         let binding = Binding {
             chat_id: "oc_p2p".to_string(),
             open_id: "ou_owner".to_string(),
-            bound_unix: now_unix(),
+            // 0 lets the fixture messages (created "now") count as new.
+            bound_unix: 0,
         };
         let cursor = Cursor {
             last_create_time_ms: now_unix() * 1000 - 5000,

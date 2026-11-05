@@ -94,15 +94,8 @@ jobs:
           set -euo pipefail
           name="${{ matrix.name }}"
           target="${{ matrix.target }}"
-          staging="dist/$name"
-          mkdir -p "$staging/packaging/systemd" "$staging/packaging/launchd"
-          cp "target/$target/release/promptsync" "$staging/"
-          cp README.md LICENSE "$staging/"
-          cp -R templates "$staging/"
-          cp packaging/systemd/*.service.in "$staging/packaging/systemd/"
-          cp packaging/launchd/*.plist "$staging/packaging/launchd/"
-          cp packaging/install.sh "$staging/packaging/"
-          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          mkdir -p dist
+          tar -C "target/$target/release" -czf "dist/$name.tar.gz" promptsync
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -110,14 +103,8 @@ jobs:
           $ErrorActionPreference = "Stop"
           $name = "${{ matrix.name }}"
           $target = "${{ matrix.target }}"
-          $staging = "dist/$name"
-          New-Item -ItemType Directory -Force -Path "$staging/packaging/systemd" | Out-Null
-          Copy-Item "target/$target/release/promptsync.exe" "$staging/"
-          Copy-Item README.md, LICENSE "$staging/"
-          Copy-Item -Recurse templates "$staging/"
-          Copy-Item packaging/systemd/*.service.in "$staging/packaging/systemd/"
-          Copy-Item packaging/install.sh "$staging/packaging/"
-          Compress-Archive -Path "$staging/*" -DestinationPath "dist/$name.zip" -Force
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "target/$target/release/promptsync.exe" -DestinationPath "dist/$name.zip" -Force
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

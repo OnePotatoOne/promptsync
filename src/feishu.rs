@@ -372,6 +372,172 @@ impl FeishuClient {
     }
 }
 
+/// Feishu's account host, used by the app-registration (device code) flow.
+pub const FEISHU_ACCOUNTS_BASE: &str = "https://accounts.feishu.cn";
+/// Feishu's open-platform host, used for the verification page link.
+pub const FEISHU_OPEN_BASE: &str = "https://open.feishu.cn";
+
+/// A pending "one-click app creation" session.
+#[derive(Debug, Clone)]
+pub struct AppRegistration {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_url: String,
+    pub expires_in: u64,
+    pub interval: u64,
+}
+
+/// The app credentials produced after the user confirms in the browser.
+#[derive(Debug, Clone)]
+pub struct RegisteredApp {
+    pub app_id: String,
+    pub app_secret: String,
+    pub owner_open_id: Option<String>,
+    pub tenant_brand: Option<String>,
+}
+
+/// One poll result of the app-registration device flow.
+#[derive(Debug, Clone)]
+pub enum RegistrationPoll {
+    Pending,
+    SlowDown,
+    Success(RegisteredApp),
+    Denied(String),
+    Expired(String),
+}
+
+fn post_form(agent: &ureq::Agent, url: &str, fields: &[(&str, &str)]) -> Result<Value> {
+    let response = match agent.post(url).send_form(fields) {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, response)) => {
+            let text = response.into_string().unwrap_or_default();
+            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                return Ok(value);
+            }
+            bail!("Feishu HTTP {code} for {url}: {text}");
+        }
+        Err(err) => bail!("Feishu request to {url} failed: {err}"),
+    };
+    let text = response.into_string().unwrap_or_default();
+    serde_json::from_str(&text)
+        .with_context(|| format!("Feishu returned invalid JSON from {url}: {text}"))
+}
+
+/// Start a one-click app registration: Feishu returns a short user code and a
+/// verification URL the user opens to create/authorise a PersonalAgent app.
+pub fn begin_app_registration(timeout: Duration) -> Result<AppRegistration> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5).min(timeout))
+        .timeout(timeout)
+        .build();
+    let value = post_form(
+        &agent,
+        &format!("{FEISHU_ACCOUNTS_BASE}/oauth/v1/app/registration"),
+        &[
+            ("action", "begin"),
+            ("archetype", "PersonalAgent"),
+            ("auth_method", "client_secret"),
+            ("request_user_info", "open_id tenant_brand"),
+        ],
+    )?;
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        let detail = value
+            .get("error_description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        bail!("Feishu app registration failed: {error} {detail}");
+    }
+    let device_code = value
+        .get("device_code")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let user_code = value
+        .get("user_code")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if device_code.is_empty() || user_code.is_empty() {
+        bail!("Feishu app registration returned no device_code/user_code");
+    }
+    let verification_url =
+        format!("{FEISHU_OPEN_BASE}/page/cli?user_code={user_code}&from=xdt-maker");
+    Ok(AppRegistration {
+        device_code,
+        user_code,
+        verification_url,
+        expires_in: value
+            .get("expires_in")
+            .and_then(Value::as_u64)
+            .unwrap_or(300),
+        interval: value.get("interval").and_then(Value::as_u64).unwrap_or(5),
+    })
+}
+
+/// Poll the registration flow once.
+pub fn poll_app_registration(device_code: &str, timeout: Duration) -> Result<RegistrationPoll> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5).min(timeout))
+        .timeout(timeout)
+        .build();
+    let value = post_form(
+        &agent,
+        &format!("{FEISHU_ACCOUNTS_BASE}/oauth/v1/app/registration"),
+        &[("action", "poll"), ("device_code", device_code)],
+    )?;
+    Ok(parse_registration_poll(&value))
+}
+
+fn parse_registration_poll(value: &Value) -> RegistrationPoll {
+    let user_info = value.get("user_info").cloned().unwrap_or(Value::Null);
+    let owner_open_id = user_info
+        .get("open_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    let tenant_brand = user_info
+        .get("tenant_brand")
+        .and_then(Value::as_str)
+        .filter(|brand| !brand.is_empty())
+        .map(str::to_string);
+    let error = value
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let detail = value
+        .get("error_description")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if error.is_empty() {
+        let app_id = value
+            .get("client_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let app_secret = value
+            .get("client_secret")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !app_id.is_empty() && !app_secret.is_empty() {
+            return RegistrationPoll::Success(RegisteredApp {
+                app_id,
+                app_secret,
+                owner_open_id,
+                tenant_brand,
+            });
+        }
+        return RegistrationPoll::Pending;
+    }
+    match error {
+        "authorization_pending" => RegistrationPoll::Pending,
+        "slow_down" => RegistrationPoll::SlowDown,
+        "access_denied" => RegistrationPoll::Denied(detail.to_string()),
+        "expired_token" | "invalid_grant" => RegistrationPoll::Expired(detail.to_string()),
+        other => RegistrationPoll::Denied(format!("{other} {detail}").trim().to_string()),
+    }
+}
+
 fn parse_response(text: &str) -> Result<Value> {
     let value: Value = serde_json::from_str(text)
         .with_context(|| format!("Feishu returned invalid JSON: {text}"))?;
@@ -550,5 +716,48 @@ mod tests {
         assert!(parse_response(r#"{"code":0,"msg":"ok","data":{}}"#).is_ok());
         let err = parse_response(r#"{"code":99991663,"msg":"invalid token"}"#).unwrap_err();
         assert!(err.to_string().contains("99991663"));
+    }
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    #[test]
+    fn poll_success_carries_owner() {
+        let value = serde_json::json!({
+            "client_id": "cli_x",
+            "client_secret": "sec",
+            "user_info": {"open_id": "ou_1", "tenant_brand": "feishu"}
+        });
+        match parse_registration_poll(&value) {
+            RegistrationPoll::Success(app) => {
+                assert_eq!(app.app_id, "cli_x");
+                assert_eq!(app.app_secret, "sec");
+                assert_eq!(app.owner_open_id.as_deref(), Some("ou_1"));
+                assert_eq!(app.tenant_brand.as_deref(), Some("feishu"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_pending_and_denied() {
+        assert!(matches!(
+            parse_registration_poll(&serde_json::json!({"error": "authorization_pending"})),
+            RegistrationPoll::Pending
+        ));
+        assert!(matches!(
+            parse_registration_poll(&serde_json::json!({"error": "slow_down"})),
+            RegistrationPoll::SlowDown
+        ));
+        assert!(matches!(
+            parse_registration_poll(&serde_json::json!({"error": "access_denied"})),
+            RegistrationPoll::Denied(_)
+        ));
+        assert!(matches!(
+            parse_registration_poll(&serde_json::json!({"error": "expired_token"})),
+            RegistrationPoll::Expired(_)
+        ));
     }
 }

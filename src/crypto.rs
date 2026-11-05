@@ -42,6 +42,38 @@ fn mac_eq(left: &[u8], right: &[u8]) -> bool {
     left.len() == right.len() && left.ct_eq(right).unwrap_u8() == 1
 }
 
+/// Domain-separation salt for turning a human passphrase into the cluster
+/// secret. It must stay constant so that separately compiled binaries derive
+/// the same key from the same passphrase.
+const SECRET_KDF_SALT: &[u8] = b"promptsync cluster secret v1";
+/// PBKDF2 work factor. Costs roughly 0.2 s once per explicit passphrase
+/// entry; the derived key (hex) is what gets stored in config.toml.
+const SECRET_KDF_ROUNDS: u32 = 300_000;
+
+/// PBKDF2-HMAC-SHA256 with a single 32-byte output block.
+///
+/// `password` is the UTF-8 passphrase, `salt` the domain separator and
+/// `rounds` the iteration count. Returns the 32-byte derived key.
+fn pbkdf2_sha256(password: &[u8], salt: &[u8], rounds: u32) -> [u8; 32] {
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(password).expect("HMAC accepts keys of any length");
+    mac.update(salt);
+    mac.update(&1u32.to_be_bytes());
+    let mut block = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&block);
+    for _ in 1..rounds.max(1) {
+        let mut mac =
+            <HmacSha256 as Mac>::new_from_slice(password).expect("HMAC accepts keys of any length");
+        mac.update(&block);
+        block = mac.finalize().into_bytes();
+        for (slot, byte) in out.iter_mut().zip(block.iter()) {
+            *slot ^= byte;
+        }
+    }
+    out
+}
+
 /// A 32-byte cluster secret. Either compiled into the build (random per build)
 /// or configured by the operator. It authenticates knocks and handshakes.
 #[derive(Clone)]
@@ -70,6 +102,27 @@ impl ClusterSecret {
         let mut out = [0u8; 32];
         out.copy_from_slice(&bytes);
         Ok(Self(out))
+    }
+
+    /// Accept either a legacy 64-hex secret or a human passphrase.
+    ///
+    /// A passphrase is stretched with PBKDF2-HMAC-SHA256 (300k rounds) using a
+    /// fixed domain salt, so every machine that types the same phrase derives
+    /// the same key. Hex input is passed through for backwards compatibility.
+    pub fn from_input(input: &str) -> Result<Self> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            bail!("集群口令不能为空");
+        }
+        let is_hex = trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit());
+        if is_hex {
+            return Self::from_hex(trimmed);
+        }
+        Ok(Self(pbkdf2_sha256(
+            trimmed.as_bytes(),
+            SECRET_KDF_SALT,
+            SECRET_KDF_ROUNDS,
+        )))
     }
 
     pub fn random() -> Self {
@@ -710,5 +763,40 @@ mod tests {
         assert!(!window.would_accept(1));
         assert!(!window.would_accept(2_000));
         assert!(window.would_accept(1_999));
+    }
+
+    #[test]
+    fn pbkdf2_matches_rfc_vector() {
+        let out = pbkdf2_sha256(b"password", b"salt", 1);
+        assert_eq!(
+            hex::encode(out),
+            "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
+        );
+    }
+
+    #[test]
+    fn passphrase_derivation_is_deterministic() {
+        let a = ClusterSecret::from_input("我们家的同步口令").unwrap();
+        let b = ClusterSecret::from_input("  我们家的同步口令  ").unwrap();
+        assert_eq!(a.to_hex(), b.to_hex());
+    }
+
+    #[test]
+    fn different_passphrases_differ() {
+        let a = ClusterSecret::from_input("alpha").unwrap();
+        let b = ClusterSecret::from_input("beta").unwrap();
+        assert_ne!(a.to_hex(), b.to_hex());
+    }
+
+    #[test]
+    fn hex_input_is_used_verbatim() {
+        let hex = "aa".repeat(32);
+        let secret = ClusterSecret::from_input(&hex).unwrap();
+        assert_eq!(secret.to_hex(), hex);
+    }
+
+    #[test]
+    fn empty_passphrase_is_rejected() {
+        assert!(ClusterSecret::from_input("   ").is_err());
     }
 }

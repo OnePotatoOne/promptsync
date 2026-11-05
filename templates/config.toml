@@ -5,10 +5,11 @@
 #
 # 生成时 {home} / {cindy_root} / {config_dir} 会被替换成本机实际路径。
 
-# 集群密钥：留空 = 使用编译进当前二进制的那把随机密钥。
-# 多台机器若不是用同一个二进制编译的，需要在这里填入相同的 64 位 hex：
-#   服务端: promptsync secret --show
-#   其他端: promptsync secret --set <hex>
+# 集群口令：留空 = 使用编译进当前二进制的那把随机密钥。
+# 多台机器若不是用同一个二进制编译的，在向导第 3 步输入同一句话即可
+# （任意短语/密码，不必是十六进制；程序用 PBKDF2 推导密钥）：
+#   promptsync secret --set "同一句口令"
+# 也兼容旧的 64 位 hex。
 cluster_secret = ""
 
 [server]
@@ -55,6 +56,7 @@ connect_attempts = 3
 
 [feishu]
 # 自建应用（不是群自定义机器人 webhook）。凭据只保存在本机配置目录，绝不提交。
+# 首次启动 `promptsync server` 的向导第 4 步可以一键创建（点链接确认即可）。
 enabled = false
 notify_on_recovery = true
 timeout_secs = 10
@@ -65,7 +67,7 @@ repeat_alert_secs = 0
 # 飞书开放平台 -> 企业自建应用 -> 凭证与基础信息
 app_id = ""
 app_secret = ""
-# 首次启动 `promptsync server` 的向导第 4 步会扫码绑定并自动填写
+# 一键创建应用时会自动填入；手动粘贴时绑定后也会写回
 owner_open_id = ""
 # 测试时可改为本地 mock 地址
 api_base = "https://open.feishu.cn"

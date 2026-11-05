@@ -34,6 +34,8 @@ cargo build --release
 
 飞书使用**自建应用**，`app_id`/`app_secret` 只保存在本机配置目录，**不会编进二进制**。
 
+> Release 里的压缩包**只有一个可执行文件**：`promptsync`（Windows 为 `promptsync.exe`）。配置模板已经编译进二进制，首次启动自动生成，不需要额外的 README、模板或安装脚本。
+
 同一次 `cargo build` 产出的 server 和 agent 天然共享密钥；**不同次编译**的二进制默认互不信任，这是刻意设计。
 
 ### 1.2 个人配置目录（默认 `./config`）
@@ -70,11 +72,11 @@ promptsync --config /etc/promptsync/config.toml status   # 直接指定文件（
 - **服务端首次启动（5 步）**
   1. 监听地址与数据端口（0 = 由密钥自动推导）；
   2. 要同步的 prompt 文件：自动列出候选（`system_prompt.md` / `SOUL.md`），多个时用序号选一个，并问"以后只同步这一个文件吗"；
-  3. 集群密钥：显示当前指纹，直接回车用编译进二进制的随机密钥，或粘贴同一串 64 位 hex；
-  4. 飞书：确认是否启用 → 填 `app_id` / `app_secret` → 当场校验凭据 → 打印二维码/链接，扫码发一句消息即完成绑定（超时自动回退到邮箱/手机号）；
+  3. 集群口令：显示当前指纹，直接回车用编译进二进制的密钥；也可以输入**任意一句话**（所有机器保持一致），程序自动推导密钥，不需要十六进制；
+  4. 飞书：确认启用 → 默认「一键创建」，点开链接确认后自动填好 `app_id` / `app_secret` 和 owner，并当场完成绑定；也支持手动粘贴已有应用凭据；
   5. 摘要确认：显示监听、受管文件、密钥、飞书状态，回车开始运行。
 - **agent 首次启动（4 步）**
-  1. 服务端地址与端口；2. 集群密钥；3. 可选的 agent 端飞书告警凭据；4. 摘要确认。
+  1. 服务端地址与端口；2. 集群口令；3. 可选的 agent 端飞书告警凭据；4. 摘要确认。
 - **后续启动**：只问一句"直接使用已有配置启动？[Y/n]"；选 `n` 就重新进入向导（所以改配置、重绑飞书都走同一个入口）。
 - 每一步都会**立即写回** `config/config.toml`（保留注释），中途退出也不会丢已填的内容。
 - **不会打扰脚本和服务**：非 TTY、`--non-interactive`、或已用 `--server` / `--port` / `--bind` / `--once` 覆盖时，自动跳过向导。
@@ -92,7 +94,7 @@ cd ~/workspace/promptSync
 ./target/release/promptsync server
 ```
 
-首次运行会创建 `config/config.toml`，并进入逐步向导（见 [1.2.1](#121-启动向导server--agent)）。飞书的扫码绑定就在向导第 4 步完成。日志会显示数据端口与敲门端口池（默认 12 个）；每次敲门随机选 3–6 个端口、随机顺序、随机间隔。数据端口**只有在敲门成功后才会被绑定**，扫描器看到的是「关闭」状态。
+首次运行会创建 `config/config.toml`，并进入逐步向导（见 [1.2.1](#121-启动向导server--agent)）。飞书的一键创建和绑定就在向导第 4 步完成。日志会显示数据端口与敲门端口池（默认 12 个）；每次敲门随机选 3–6 个端口、随机顺序、随机间隔。数据端口**只有在敲门成功后才会被绑定**，扫描器看到的是「关闭」状态。
 
 ### 1.4 启动 agent
 
@@ -113,20 +115,20 @@ cd ~/workspace/promptSync
 三种方式任选：
 
 1. **分发同一个二进制**（最省事）：所有机器用同一份 `cargo build` 产物。
-2. **显式设置集群密钥**：
+2. **输入同一句口令**（推荐）：
    ```bash
-   # 服务端
-   promptsync secret --show        # 打印 64 位 hex（注意保密）
-   # agent 端（会写进该机器的 config/config.toml，保留模板注释）
-   promptsync secret --set <hex>
+   # 在向导第 3 步直接输入这句话即可；也可以命令行写入
+   promptsync secret --set "我们家的同步口令"
    ```
-3. **自己生成密钥**（推荐用于公网发布版）：
-   ```bash
-   promptsync secret --generate    # 打印一个新的随机密钥
-   promptsync secret --set <hex>   # 服务端和所有 agent 都设置同一个值
-   ```
+   程序用 PBKDF2-HMAC-SHA256 从这句话推导密钥，所有机器输入**完全相同**的一句话（含空格、大小写）就会得到同一个密钥。不需要记十六进制。
+3. **兼容旧方式**：`promptsync secret --set <64 位 hex>` 仍然有效（例如从旧配置迁移）。
 
-只要 `cluster_secret` 相同，端口池、敲门标签密钥、握手密钥都会自动一致；无需手工对齐端口。敲门的具体端口/顺序每次都随机，不依赖任何固定序列。
+```bash
+promptsync secret --show        # 查看当前十六进制（注意保密，仅排障用）
+promptsync secret --generate    # 生成一个新的随机 hex（高级用法）
+```
+
+只要最终密钥相同，端口池、敲门标签密钥、握手密钥都会自动一致；无需手工对齐端口。敲门的具体端口/顺序每次都随机，不依赖任何固定序列。
 
 ---
 
@@ -210,7 +212,7 @@ agent                         server
 
 ### 4.2 边界与注意事项
 
-1. **公开二进制内含密钥**：公开发的 release 二进制里必然带着它的集群密钥（这是「编译期随机」的直接结果）。把公开二进制用于自己的私有集群并不安全——请用 `promptsync secret --set` 换成只有你知道的密钥（推荐每次发布后都换）。
+1. **公开二进制内含密钥**：公开发的 release 二进制里必然带着它的集群密钥（这是「编译期随机」的直接结果）。把公开二进制用于自己的私有集群并不安全——请用 `promptsync secret --set "只有你知道的一句话"` 换掉它（推荐每次发布后都换）。
 2. **用户态端口敲门 ≠ 防火墙敲门**：本工具不修改 iptables/nftables/pf。扫描器看到端口是关闭的，但服务器本机上仍能看到进程；如果需要内核级隐藏，可在防火墙只放行敲门端口池 + 数据端口给 `promptsync` 用户。
 3. **无 per-agent 身份**：所有 agent 共享集群密钥。任何拿到密钥的人都能读 prompt 集；如需区分设备，请为每台机器使用不同的 `cluster_secret` 与独立端口（多实例），或后续扩展为每设备密钥。
 4. **UDP 可靠性**：本工具自带分片/ACK/重传，但极端丢包或 NAT 表项超时会失败并重试下一轮；不保证跨公网稳定，推荐内网、WireGuard/Tailscale 等加密隧道内使用（隧道 + 本工具加密 = 双层保护）。
@@ -223,38 +225,34 @@ agent                         server
 
 旧的"群自定义机器人 webhook"已经**完全移除**。现在所有飞书能力（发消息、读私聊、离线告警）都走一个**企业自建应用**。
 
-### 5.1 一次性在飞书开放平台创建应用
+### 5.1 一键创建应用（推荐）
 
-1. 打开 [飞书开放平台](https://open.feishu.cn/app) → 创建**企业自建应用**；
-2. 「添加应用能力」→ 启用**机器人**；
-3. 「权限管理」至少授予：
-   - `im:message:readonly`（读私聊消息，控制通道）
-   - `im:message:send_as_bot`（回执 + 离线告警）
-   - `im:chat:readonly`（绑定阶段列会话，建议）
-   - `contact:user.id:readonly`（仅在使用邮箱/手机号回退绑定时需要）
-4. 「版本管理与发布」→ 创建版本并发布（企业内可用）；
-5. 拿到 `app_id` / `app_secret`，**不用手动改配置**——在 `promptsync server` 的向导第 4 步里填进去即可。
+不需要提前去开放平台点一堆按钮。`promptsync server` 向导第 4 步默认就是「一键创建」：
+
+1. 程序向飞书申请一个设备码，打印一个链接和二维码：
+   ```
+   https://open.feishu.cn/page/cli?user_code=XXXX-XXXX&from=xdt-maker
+   ```
+2. 用飞书扫码或在浏览器打开，按提示**确认创建**（会自动创建个人助手类型的自建应用，启用机器人能力并带上所需权限）；
+3. 程序在后台轮询，确认后自动拿到 `app_id`、`app_secret` 和你的 `open_id`，直接写进 `config.toml`；
+4. 自动用你的 `open_id` 发一条消息，拿到私聊 `chat_id`，绑定完成——**不需要复制粘贴，也不需要先给机器人发消息**。
+
+如果企业策略不允许一键创建，或者你想用已有应用，向导里选「已有应用，手动粘贴」，按提示填 `app_id` / `app_secret` 即可。手动创建时需要：
+
+- 启用**机器人**能力；
+- 权限：`im:message:readonly`、`im:message:send_as_bot`、`im:chat:readonly`；
+- 创建版本并发布到企业内。
 
 > 应用凭据只存在本机配置目录（0600），不会进入 git，也不会编译进二进制。
 
-### 5.2 在启动向导里绑定（扫码 / 点链接）
+### 5.2 绑定与重新绑定
 
-`promptsync server` 向导的第 4 步就是飞书绑定，填完 `app_id` / `app_secret` 并校验通过后，会打印终端二维码和链接：
+- **一键创建**：创建完成即自动绑定，写入 `config/feishu-binding.json`，`owner_open_id` 写回 `config.toml`。
+- **手动粘贴凭据**：校验通过后，程序会打印机器人链接/二维码；你打开私聊随便发一句话，服务端检测到后自动绑定。若 90 秒内没检测到（部分租户不返回私聊会话），会回退让你输入飞书邮箱/手机号主动绑定。
+- **服务启动后还没绑定**：不用重跑。服务端会每隔几秒检查一次，你只要在飞书里给机器人**发一条私聊消息**，就会自动完成绑定并开始工作。
+- **换账号 / 重新绑定**：重新运行 `promptsync server`，在「直接使用已有配置启动？」处选 `n`，第 4 步选「继续使用这个应用？」否，再走一次一键创建或手动流程。没有单独的绑定命令。
 
-```
-https://applink.feishu.cn/client/bot/open?appId=cli_xxxxxxxx
-```
-
-1. 用飞书扫码（或点开链接）进入**和机器人的私聊**；
-2. 随便发一句"绑定"；
-3. 服务端在后台轮询，检测到这条私聊消息后自动完成绑定；
-4. 绑定结果写入 `config/feishu-binding.json`，`owner_open_id` 写回 `config.toml`，然后继续走摘要确认。
-
-如果 90 秒内没检测到（飞书有些租户不会把私聊会话列出来），会在同一个步骤里回退：提示你输入**飞书邮箱或手机号**，服务端查到 `open_id` 后主动发消息拿 `chat_id`。
-
-**重新绑定 / 换账号**：重新运行 `promptsync server`，在"直接使用已有配置启动？"处选 `n` 进入向导，第 4 步会重新走绑定流程。没有单独的绑定命令。
-
-非交互环境（systemd/launchd/`--non-interactive`）不会进入向导；需要绑定时在终端里手动跑一次 `promptsync server` 即可。
+非交互环境（systemd/launchd/`--non-interactive`）不会进入向导；在终端里手动跑一次 `promptsync server` 配置即可。
 
 ### 5.3 用飞书私聊覆盖服务端 prompt（控制通道）
 
@@ -269,10 +267,10 @@ https://applink.feishu.cn/client/bot/open?appId=cli_xxxxxxxx
 - 服务端回一条回执：`✅ 已更新 <source id/相对路径>（xxx B，sha256 xxxxxxxx）`；
 - 写盘后 2 秒内 watcher 重算 hash、epoch+1，所有 agent 在 10 秒内拉到新内容。
 
-`sync.target` 指定"唯一受管文件"，格式 `<source id>/<相对路径>`。首次启动时如果它是空的，会自动找**唯一的非空** `system_prompt.md` 或 `SOUL.md`：
+`sync.target` 指定"唯一受管文件"，格式 `<source id>/<相对路径>`。向导第 2 步会扫描 `system_prompt.md` / `SOUL.md`：
 
-- 只有一个非空候选：写回 `sync.target`，并询问"以后只同步这一个文件吗？"（默认是，选是会把该 source 的 globs 收窄到这一个文件）；
-- 有多个非空候选或一个都没有：只在日志里提示，请你手动设置 `sync.target`。
+- 只有一个非空候选：直接选中，并询问"以后只同步这一个文件吗？"（默认是，选是会把该 source 的 globs 收窄到这一个文件）；
+- 有多个非空候选：列出序号让你选；一个都没有时允许手动输入 `sync.target`。
 
 单文件模式下 bundle 里永远只有这一个文件；`sync.delete_removed = false` 保证以后缩小同步范围时不会删除 agent 上已有的其他文件。
 
@@ -305,7 +303,7 @@ promptsync feishu-test --text "自定义内容"
 配置文件由 `templates/config.toml` 生成到配置目录；完整注释见模板本身。关键项：
 
 ```toml
-cluster_secret = ""       # 空 = 使用编译进二进制的密钥；64 位 hex，多机一致
+cluster_secret = ""       # 空 = 使用编译进二进制的密钥；也可填任意口令（多机一致）或旧 64 位 hex
 
 [server]
 bind = "0.0.0.0"
@@ -340,17 +338,17 @@ timeout_secs = 10
 repeat_alert_secs = 0
 
 [feishu.app]
-app_id = ""                # 飞书自建应用
+app_id = ""                # 飞书自建应用（向导可一键创建）
 app_secret = ""            # 只在本机配置目录
 owner_open_id = ""         # 绑定后自动写入；离线告警也发给它
 api_base = "https://open.feishu.cn"
 
 [feishu.control]
-poll_secs = 5              # 轮询绑定私聊的间隔
+poll_secs = 5              # 轮询私聊的间隔（未绑定时也用它重试绑定）
 max_message_bytes = 32768  # 超过则拒绝覆盖
 dry_run = false
 bind_timeout_secs = 90
-bind_contact = ""          # 可选：回退绑定的邮箱/手机号
+bind_contact = ""          # 可选：手动绑定时回退用的邮箱/手机号
 keep_backups = 50          # 0 = 保留全部 .bak
 
 [logging]
@@ -398,7 +396,7 @@ globs = ["*/bots/*/system_prompt.md"]
 ### Linux（systemd user）
 
 ```bash
-# 安装二进制、生成 config/、写入带绝对路径的 unit
+# 需要源码仓库里的 packaging/install.sh（release 压缩包只有二进制）
 PROJECT_DIR=~/workspace/promptSync sh packaging/install.sh ./target/release/promptsync agent
 systemctl --user daemon-reload
 systemctl --user enable --now promptsync-agent
@@ -411,12 +409,13 @@ journalctl --user -u promptsync-agent -f
 ### macOS（launchd）
 
 ```bash
+# 需要源码仓库里的 packaging/install.sh（release 压缩包只有二进制）
 PROJECT_DIR=~/workspace/promptSync sh packaging/install.sh ./target/release/promptsync agent
 launchctl load -w ~/Library/LaunchAgents/com.cindy.promptsync.agent.plist
 tail -f ~/workspace/promptSync/config/logs/agent.log
 ```
 
-也可以用 `packaging/install.sh` 一键安装二进制 + 生成服务文件（不自动 sudo）。
+也可以用源码仓库里的 `packaging/install.sh` 一键安装二进制 + 生成服务文件（不自动 sudo；release 压缩包只包含可执行文件，不含该脚本）。
 
 ---
 
@@ -459,12 +458,12 @@ cargo build --release
 | 配置目录不对 / 找不到配置 | `promptsync status` 第一段就打印 `config dir`；用 `--config-dir` 或 `PROMPTSYNC_CONFIG_DIR` 固定 |
 | 服务启动后生成了新的空配置 | 服务的工作目录变了；unit 里设置 `WorkingDirectory` 并传 `--config-dir <绝对路径>` |
 | `no handshake answer` | 两端 `promptsync ports` 看数据端口与敲门端口池是否一致；`cluster_secret` 是否相同；防火墙是否放行整个 UDP 端口池 |
-| `HELLO failed authentication (cluster secret mismatch?)` | 密钥不一致，用 `secret --show` / `secret --set` 对齐 |
+| `HELLO failed authentication (cluster secret mismatch?)` | 口令不一致，所有机器输入同一句话（`secret --set "同一句口令"`）；旧 64 位 hex 也能用 |
 | 每轮都拉包 | 本地有 agent 未配置的 source（日志有 `skipping ...`），或本地文件被反复改动 |
 | `bundle too large` | 调大 `sync.max_bundle_bytes`（单条加密消息上限约 4.4 MiB，base64 后实际可传约 3 MiB） |
 | 时间戳相关错误 | 两端系统时钟偏差：敲门容忍 ±60s，握手 ±600s，先校时（NTP） |
 | 端口被占用 | `server.port` 与其他服务冲突；数据端口只在敲门后绑定，但配置端口仍需唯一 |
-| 飞书绑定一直超时 | 有些租户不会返回私聊会话；等 90 秒后用邮箱/手机号回退，或重新运行 `server` 进入向导再试 |
+| 飞书没绑定成功 | 一键创建会自动绑定；手动粘贴凭据时，给机器人发一条私聊消息即可，服务启动后也会自动检测并绑定，不必重跑 |
 | 飞书返回 99991663 / permission denied | `app_id`/`app_secret` 不对，或应用没发布、没授予 `im:message:readonly` / `im:message:send_as_bot` |
 | 发消息没反应 | 必须是在**绑定的私聊**里由你本人发**纯文本**；群聊、他人、富文本都会被忽略（日志里有原因） |
 | 覆盖后 agent 没更新 | 确认 `sync.target` 指向的文件确实在 server 的 source glob 内，且 `promptsync status` 的 hash 已变化 |

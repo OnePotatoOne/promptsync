@@ -90,8 +90,8 @@ enum Command {
         /// Print a fresh random secret
         #[arg(long)]
         generate: bool,
-        /// Store this hex secret in the configuration file
-        #[arg(long, value_name = "HEX")]
+        /// Store this passphrase (or legacy 64-hex secret) in the configuration file
+        #[arg(long, value_name = "PASSPHRASE")]
         set: Option<String>,
     },
     /// Send a test message through the Feishu app
@@ -166,7 +166,7 @@ async fn dispatch(cli: Cli) -> Result<u8> {
             }
             logger.info(format!("configuration: {}", paths.config_file.display()));
             tokio::select! {
-                result = server::run(config, logger.clone(), paths.data_dir()) => result?,
+                result = server::run(config, logger.clone(), paths.data_dir(), paths.config_file.clone()) => result?,
                 _ = shutdown_signal() => logger.info("shutdown signal received"),
             }
             Ok(0)
@@ -288,7 +288,7 @@ fn init(paths: &Paths, force: bool) -> Result<u8> {
     println!("  1. on the server:  promptsync server");
     println!("  2. on each agent:  set agent.server in the config, then promptsync agent");
     println!(
-        "  3. if you build separately per machine, run `promptsync secret --show` on the server\n     and `promptsync secret --set <hex>` on the agents so they share the secret."
+        "  3. if you build separately per machine, run `promptsync secret --show` on the server\n     or pick one passphrase and enter it on every machine (wizard step 3 / `secret --set <passphrase>`)."
     );
     Ok(0)
 }
@@ -349,7 +349,7 @@ fn secret(
         return Ok(0);
     }
     if let Some(value) = set {
-        let secret = ClusterSecret::from_hex(value)?;
+        let secret = ClusterSecret::from_input(value)?;
         config.cluster_secret = secret.to_hex();
         set_cluster_secret(&paths.config_file, &secret.to_hex())?;
         println!(
@@ -357,7 +357,7 @@ fn secret(
             paths.config_file.display(),
             secret.fingerprint()
         );
-        println!("# copy the same value to every other machine");
+        println!("# type the same passphrase on every other machine");
         return Ok(0);
     }
     let secret = resolve_secret(config)?;

@@ -114,7 +114,9 @@ async fn start_server(cluster: &Cluster) -> tokio::task::JoinHandle<anyhow::Resu
     let config = cluster.server_config.clone();
     let logger = cluster.server_logger.clone();
     let data_dir = cluster.temp.path().join("server-state");
-    let handle = tokio::spawn(async move { server::run(config, logger, data_dir).await });
+    let config_file = cluster.temp.path().join("server-config.toml");
+    let handle =
+        tokio::spawn(async move { server::run(config, logger, data_dir, config_file).await });
     tokio::time::sleep(Duration::from_millis(500)).await;
     handle
 }

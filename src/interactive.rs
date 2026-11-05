@@ -7,10 +7,11 @@
 
 use anyhow::Result;
 use std::io::{self, IsTerminal, Write};
+use std::time::{Duration, Instant};
 
 use crate::config::{set_value, Config};
 use crate::crypto::ClusterSecret;
-use crate::feishu::FeishuClient;
+use crate::feishu::{self, FeishuClient};
 use crate::feishu_control;
 use crate::logx::Logger;
 use crate::paths::Paths;
@@ -352,14 +353,14 @@ fn configure_secret(config: &mut Config, paths: &Paths, prompter: &Prompter) -> 
         "配置文件里的密钥"
     };
     println!("当前使用：{source}（指纹 {}）。", secret.fingerprint());
-    println!("如果所有机器用的是同一次编译的二进制，直接回车即可；");
-    println!("如果是分别编译的，需要在这里填同一串 64 位 hex（输入内容会显示在终端）。");
-    if prompter.confirm("使用当前密钥？", true) {
-        return Ok(());
-    }
+    println!("所有机器只要输入同一句话（任意短语或密码，不必是十六进制），");
+    println!("程序会自动推导出加密密钥。直接回车保持当前设置。");
     loop {
-        let value = prompter.text("集群密钥（64 位 hex）", "");
-        match ClusterSecret::from_hex(&value) {
+        let value = prompter.text("集群口令", "");
+        if value.trim().is_empty() {
+            return Ok(());
+        }
+        match ClusterSecret::from_input(&value) {
             Ok(secret) => {
                 apply(
                     paths,
@@ -368,10 +369,18 @@ fn configure_secret(config: &mut Config, paths: &Paths, prompter: &Prompter) -> 
                     &toml_string(&secret.to_hex()),
                 )?;
                 config.cluster_secret = secret.to_hex();
-                println!("已更新，指纹 {}。", secret.fingerprint());
+                let kind = if value.trim().len() == 64
+                    && value.trim().chars().all(|c| c.is_ascii_hexdigit())
+                {
+                    "按 64 位 hex 使用"
+                } else {
+                    "已由口令推导"
+                };
+                println!("已更新（{kind}），指纹 {}。", secret.fingerprint());
+                println!("其它机器输入完全相同的一句话即可，大小写和空格都算数。");
                 return Ok(());
             }
-            Err(err) => eprintln!("密钥无效：{err}"),
+            Err(err) => eprintln!("口令无效：{err}"),
         }
     }
 }
@@ -384,7 +393,7 @@ fn configure_feishu(
     default_enabled: bool,
 ) -> Result<()> {
     println!("飞书用企业自建应用接收你私聊发来的纯文本，覆盖服务端那一个 prompt 文件；");
-    println!("同一个应用也用来发离线告警（不再使用群机器人 webhook）。");
+    println!("同一个应用也用来发离线告警。");
     if !prompter.confirm("启用飞书？", default_enabled) {
         apply(paths, Some("feishu"), "enabled", "false")?;
         config.feishu.enabled = false;
@@ -394,24 +403,145 @@ fn configure_feishu(
     apply(paths, Some("feishu"), "enabled", "true")?;
     config.feishu.enabled = true;
 
-    println!("\n需要先在飞书开放平台创建企业自建应用：");
-    println!("  1) 启用「机器人」能力；");
-    println!("  2) 权限：im:message:readonly、im:message:send_as_bot、im:chat:readonly；");
-    println!("  3) 创建版本并发布；");
-    println!("  4) 在「凭证与基础信息」里复制 app_id / app_secret。\n");
+    let has_app = !config.feishu.app.app_id.trim().is_empty()
+        && !config.feishu.app.app_secret.trim().is_empty();
+    if has_app {
+        println!("已配置应用 {}。", mask_id(config.feishu.app.app_id.trim()));
+        if prompter.confirm("继续使用这个应用？", true) {
+            return finish_feishu(config, paths, prompter, logger);
+        }
+    }
 
+    let options = [
+        "一键创建（推荐）：点开链接确认，自动填好 app_id / app_secret".to_string(),
+        "已有应用：手动粘贴 app_id / app_secret".to_string(),
+        "跳过飞书".to_string(),
+    ];
+    let choice = prompter.select("创建飞书应用：", &options, 0);
+    match choice {
+        0 => {
+            if let Err(err) = register_feishu_app(config, paths) {
+                println!("一键创建没有完成：{err:#}");
+                if prompter.confirm("改为手动粘贴 app_id / app_secret？", true) {
+                    manual_feishu_credentials(config, paths, prompter)?;
+                } else {
+                    apply(paths, Some("feishu"), "enabled", "false")?;
+                    config.feishu.enabled = false;
+                    println!("已跳过飞书，稍后重新运行 server 即可再配置。");
+                    return Ok(());
+                }
+            }
+        }
+        1 => manual_feishu_credentials(config, paths, prompter)?,
+        _ => {
+            apply(paths, Some("feishu"), "enabled", "false")?;
+            config.feishu.enabled = false;
+            println!("已跳过飞书，稍后重新运行 server 即可再配置。");
+            return Ok(());
+        }
+    }
+    finish_feishu(config, paths, prompter, logger)
+}
+
+/// Short safe rendering of an app id for prompts/logs.
+fn mask_id(app_id: &str) -> String {
+    let chars: Vec<char> = app_id.chars().collect();
+    if chars.len() <= 10 {
+        return app_id.to_string();
+    }
+    let head: String = chars[..6].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}…{tail}")
+}
+
+/// One-click creation: ask Feishu for a device code, show the link + QR, then
+/// poll until the user confirms in the browser. On success the returned
+/// credentials and the owner open_id are written straight into config.toml.
+fn register_feishu_app(config: &mut Config, paths: &Paths) -> Result<()> {
+    println!(
+        "
+正在向飞书申请一个自建应用…"
+    );
+    let registration = feishu::begin_app_registration(Duration::from_secs(20))?;
+    println!("请打开下面的链接（或扫码），在飞书里点「确认创建」：\n");
+    println!("  {}\n", registration.verification_url);
+    feishu_control::print_qr(&registration.verification_url);
+    println!(
+        "确认后这里会自动继续，不需要复制粘贴；链接 {} 秒内有效。",
+        registration.expires_in
+    );
+    let deadline = Instant::now() + Duration::from_secs(registration.expires_in.clamp(30, 900));
+    let mut interval = registration.interval.clamp(2, 10);
+    loop {
+        if Instant::now() >= deadline {
+            anyhow::bail!("链接已过期");
+        }
+        std::thread::sleep(Duration::from_secs(interval));
+        match feishu::poll_app_registration(&registration.device_code, Duration::from_secs(20))? {
+            feishu::RegistrationPoll::Pending => {}
+            feishu::RegistrationPoll::SlowDown => interval = (interval + 5).min(15),
+            feishu::RegistrationPoll::Success(app) => {
+                apply(
+                    paths,
+                    Some("feishu.app"),
+                    "app_id",
+                    &toml_string(&app.app_id),
+                )?;
+                apply(
+                    paths,
+                    Some("feishu.app"),
+                    "app_secret",
+                    &toml_string(&app.app_secret),
+                )?;
+                config.feishu.app.app_id = app.app_id.clone();
+                config.feishu.app.app_secret = app.app_secret.clone();
+                if let Some(owner) = app.owner_open_id.as_deref() {
+                    if !owner.is_empty() {
+                        apply(
+                            paths,
+                            Some("feishu.app"),
+                            "owner_open_id",
+                            &toml_string(owner),
+                        )?;
+                        config.feishu.app.owner_open_id = owner.to_string();
+                    }
+                }
+                println!(
+                    "已创建应用 {}（owner {}）。",
+                    mask_id(&app.app_id),
+                    app.owner_open_id.as_deref().unwrap_or("未返回")
+                );
+                return Ok(());
+            }
+            feishu::RegistrationPoll::Denied(message) => {
+                anyhow::bail!("你在飞书里取消了授权 {message}")
+            }
+            feishu::RegistrationPoll::Expired(message) => {
+                anyhow::bail!("链接已过期 {message}")
+            }
+        }
+    }
+}
+
+fn manual_feishu_credentials(
+    config: &mut Config,
+    paths: &Paths,
+    prompter: &Prompter,
+) -> Result<()> {
+    println!("\n在飞书开放平台「凭证与基础信息」里复制 app_id / app_secret。");
+    println!("应用需要机器人能力，以及 im:message:readonly、im:message:send_as_bot、im:chat:readonly 权限。");
     loop {
         let app_id = prompter.text("app_id", &config.feishu.app.app_id);
         let app_secret = prompter.text("app_secret", &config.feishu.app.app_secret);
         if app_id.trim().is_empty() || app_secret.trim().is_empty() {
             println!("app_id 和 app_secret 都必须填写。");
             if !prompter.confirm("继续填写？", true) {
-                apply(paths, Some("feishu"), "enabled", "false")?;
-                config.feishu.enabled = false;
-                return Ok(());
+                anyhow::bail!("没有填写 app_id / app_secret");
             }
             continue;
         }
+        config.feishu.app.app_id = app_id.trim().to_string();
+        config.feishu.app.app_secret = app_secret.trim().to_string();
         apply(
             paths,
             Some("feishu.app"),
@@ -424,22 +554,24 @@ fn configure_feishu(
             "app_secret",
             &toml_string(app_secret.trim()),
         )?;
-        config.feishu.app.app_id = app_id.trim().to_string();
-        config.feishu.app.app_secret = app_secret.trim().to_string();
+        return Ok(());
+    }
+}
 
-        print!("校验凭据 … ");
-        let _ = io::stdout().flush();
-        match FeishuClient::from_config(config).and_then(|client| client.check()) {
-            Ok(()) => {
-                println!("通过。");
-                break;
-            }
-            Err(err) => {
-                println!("失败：{err:#}");
-                if !prompter.confirm("重新填写 app_id / app_secret？", true) {
-                    return Ok(());
-                }
-            }
+fn finish_feishu(
+    config: &mut Config,
+    paths: &Paths,
+    prompter: &Prompter,
+    logger: &Logger,
+) -> Result<()> {
+    print!("校验凭据 … ");
+    let _ = io::stdout().flush();
+    match FeishuClient::from_config(config).and_then(|client| client.check()) {
+        Ok(()) => println!("通过。"),
+        Err(err) => {
+            println!("失败：{err:#}");
+            println!("应用凭据已保存；可在下次运行 server 时重新配置。");
+            return Ok(());
         }
     }
 
@@ -449,12 +581,8 @@ fn configure_feishu(
             "飞书绑定完成：open_id {}（之后直接在这个私聊里发纯文本即可）。",
             binding.open_id
         ),
-        Ok(None) => {
-            println!("飞书还没绑定成功。服务仍会启动；下次重新运行 server 进入向导可以再绑一次。")
-        }
-        Err(err) => {
-            println!("飞书绑定失败：{err:#}。服务仍会启动；下次重新运行 server 进入向导可以再试。")
-        }
+        Ok(None) => println!("飞书还没完成绑定；服务启动后会自动等待你发来第一条私聊消息。"),
+        Err(err) => println!("飞书绑定失败：{err:#}。服务启动后仍会自动重试。"),
     }
     Ok(())
 }

@@ -66,7 +66,12 @@ struct ServerState {
     max_sessions: usize,
 }
 
-pub async fn run(config: Config, logger: Logger, data_dir: std::path::PathBuf) -> Result<()> {
+pub async fn run(
+    config: Config,
+    logger: Logger,
+    data_dir: std::path::PathBuf,
+    config_file: std::path::PathBuf,
+) -> Result<()> {
     config.validate()?;
     let secret = Arc::new(
         ClusterSecret::resolve(&config.cluster_secret).context("resolving cluster secret")?,
@@ -146,13 +151,20 @@ pub async fn run(config: Config, logger: Logger, data_dir: std::path::PathBuf) -
     if state.config.feishu.enabled {
         if !state.config.feishu_app_configured() {
             logger.info("Feishu control disabled: feishu.app.app_id / app_secret are empty");
-        } else if let Some(binding) = crate::feishu_control::load_binding(&state.data_dir) {
+        } else {
             match crate::feishu_control::resolve_target(&state.config, &state.sources) {
                 Ok(target) => {
-                    logger.info(format!(
-                        "Feishu control: private chat {} -> {} (dry_run={})",
-                        binding.chat_id, target.key, state.config.feishu.control.dry_run
-                    ));
+                    let binding = crate::feishu_control::load_binding(&state.data_dir);
+                    if let Some(binding) = binding.as_ref() {
+                        logger.info(format!(
+                            "Feishu control: private chat {} -> {} (dry_run={})",
+                            binding.chat_id, target.key, state.config.feishu.control.dry_run
+                        ));
+                    } else {
+                        logger.info(
+                            "Feishu: 尚未绑定；在飞书私聊里给机器人发一条消息即可自动完成绑定",
+                        );
+                    }
                     let config = state.config.clone();
                     let data_dir = state.data_dir.clone();
                     let logger = logger.clone();
@@ -160,6 +172,7 @@ pub async fn run(config: Config, logger: Logger, data_dir: std::path::PathBuf) -
                         if let Err(err) = crate::feishu_control::run(
                             config,
                             data_dir,
+                            config_file,
                             target,
                             binding,
                             logger.clone(),
@@ -172,8 +185,6 @@ pub async fn run(config: Config, logger: Logger, data_dir: std::path::PathBuf) -
                 }
                 Err(err) => logger.error(format!("Feishu control disabled: {err:#}")),
             }
-        } else {
-            logger.warn("Feishu control disabled: bot is not bound (re-run `promptsync server` and answer no to reconfigure)");
         }
     } else if !state.config.sync.target.trim().is_empty() {
         logger.info("Feishu control disabled (feishu.enabled = false)");
