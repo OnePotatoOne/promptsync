@@ -138,6 +138,11 @@ pub fn safe_relative_path(raw: &str) -> Option<PathBuf> {
     }
 }
 
+/// Quote a string as a TOML basic string (for `set_value`).
+pub fn toml_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;

@@ -63,29 +63,25 @@ promptsync --config /etc/promptsync/config.toml status   # 直接指定文件（
 
 > 因为默认目录是**相对当前工作目录**的 `./config`，用 systemd/launchd 长驻时请设置 `WorkingDirectory` 或直接传 `--config-dir <绝对路径>`（`packaging/install.sh` 会自动处理好）。
 
-### 1.2.1 启动交互（server / agent）
+### 1.2.1 启动向导（server / agent）
 
-`server` 和 `agent` 在**终端里**启动时会先做一次确认，避免拿错配置直接跑：
+`server` 和 `agent` 在终端里启动时会走一个**逐步向导**：一次只问一项，直接回车保留推荐值，最后给你一份摘要让你确认。不再需要额外的绑定命令。
 
-- **首次启动**（配置文件刚由模板生成）：
-  - 打印配置目录、状态目录、日志目录；
-  - 列出关键项并给出指引：agent 的 `agent.server` / `agent.port`、`cluster_secret`、`feishu.app`、`sync.sources`（服务端则是 `server.bind` / `server.port` 等）；
-  - 菜单：`1` 直接启动 / `2` 交互式修改关键项 / `3` 用 `$EDITOR` 打开配置文件。
-  - agent 首次启动且 `agent.server` 还是 `127.0.0.1` 时，默认选中 `2`，引导你先把服务端地址填好。
-- **后续启动**（已有配置）：
-  - 先问「是否使用已有配置启动？[Y/n]」，**默认是**；
-  - 选 `n` 后进入同样的菜单：交互式修改关键项（server 地址/端口）、或直接用编辑器修改；
-  - 修改写回后会重新校验，校验失败会提示继续修改或退出。
-- **不会打扰脚本和服务**：以下情况自动跳过所有提问
-  - 非终端环境（stdin/stdout 不是 TTY，例如 systemd、launchd、cron、管道）；
-  - 传了 `--non-interactive`；
-  - 已经用命令行参数覆盖了配置（`--server` / `--port` / `--bind` / `--once`）。
+- **服务端首次启动（5 步）**
+  1. 监听地址与数据端口（0 = 由密钥自动推导）；
+  2. 要同步的 prompt 文件：自动列出候选（`system_prompt.md` / `SOUL.md`），多个时用序号选一个，并问"以后只同步这一个文件吗"；
+  3. 集群密钥：显示当前指纹，直接回车用编译进二进制的随机密钥，或粘贴同一串 64 位 hex；
+  4. 飞书：确认是否启用 → 填 `app_id` / `app_secret` → 当场校验凭据 → 打印二维码/链接，扫码发一句消息即完成绑定（超时自动回退到邮箱/手机号）；
+  5. 摘要确认：显示监听、受管文件、密钥、飞书状态，回车开始运行。
+- **agent 首次启动（4 步）**
+  1. 服务端地址与端口；2. 集群密钥；3. 可选的 agent 端飞书告警凭据；4. 摘要确认。
+- **后续启动**：只问一句"直接使用已有配置启动？[Y/n]"；选 `n` 就重新进入向导（所以改配置、重绑飞书都走同一个入口）。
+- 每一步都会**立即写回** `config/config.toml`（保留注释），中途退出也不会丢已填的内容。
+- **不会打扰脚本和服务**：非 TTY、`--non-interactive`、或已用 `--server` / `--port` / `--bind` / `--once` 覆盖时，自动跳过向导。
 
 ```bash
 promptsync --non-interactive agent --config-dir /srv/promptsync/config
 ```
-
-交互式修改会**保留配置文件里的注释**（只改对应的一行）；修改前也可以随时手动编辑 `config/config.toml`。
 
 ### 1.3 启动服务端
 
@@ -96,7 +92,7 @@ cd ~/workspace/promptSync
 ./target/release/promptsync server
 ```
 
-首次运行会创建 `config/config.toml`，并在终端里显示配置指引与确认菜单（见 [1.2.1](#121-启动交互server--agent)）。如果配置里启用了飞书，还会进入一次性的扫码绑定流程（见第 5 节）。日志会显示数据端口与敲门端口池（默认 12 个）；每次敲门随机选 3–6 个端口、随机顺序、随机间隔。数据端口**只有在敲门成功后才会被绑定**，扫描器看到的是「关闭」状态。
+首次运行会创建 `config/config.toml`，并进入逐步向导（见 [1.2.1](#121-启动向导server--agent)）。飞书的扫码绑定就在向导第 4 步完成。日志会显示数据端口与敲门端口池（默认 12 个）；每次敲门随机选 3–6 个端口、随机顺序、随机间隔。数据端口**只有在敲门成功后才会被绑定**，扫描器看到的是「关闭」状态。
 
 ### 1.4 启动 agent
 
@@ -237,13 +233,13 @@ agent                         server
    - `im:chat:readonly`（绑定阶段列会话，建议）
    - `contact:user.id:readonly`（仅在使用邮箱/手机号回退绑定时需要）
 4. 「版本管理与发布」→ 创建版本并发布（企业内可用）；
-5. 把 `app_id` / `app_secret` 填到服务端 `config/config.toml` 的 `[feishu.app]`，并把 `[feishu] enabled = true`。
+5. 拿到 `app_id` / `app_secret`，**不用手动改配置**——在 `promptsync server` 的向导第 4 步里填进去即可。
 
 > 应用凭据只存在本机配置目录（0600），不会进入 git，也不会编译进二进制。
 
-### 5.2 首次启动绑定（扫码 / 点链接）
+### 5.2 在启动向导里绑定（扫码 / 点链接）
 
-服务端第一次启动时，会打印一个终端二维码和链接：
+`promptsync server` 向导的第 4 步就是飞书绑定，填完 `app_id` / `app_secret` 并校验通过后，会打印终端二维码和链接：
 
 ```
 https://applink.feishu.cn/client/bot/open?appId=cli_xxxxxxxx
@@ -252,18 +248,13 @@ https://applink.feishu.cn/client/bot/open?appId=cli_xxxxxxxx
 1. 用飞书扫码（或点开链接）进入**和机器人的私聊**；
 2. 随便发一句"绑定"；
 3. 服务端在后台轮询，检测到这条私聊消息后自动完成绑定；
-4. 绑定结果写入 `config/feishu-binding.json`，`owner_open_id` 写回 `config.toml`。
+4. 绑定结果写入 `config/feishu-binding.json`，`owner_open_id` 写回 `config.toml`，然后继续走摘要确认。
 
-如果 90 秒内没检测到（飞书有些租户不会把私聊会话列出来），会自动回退：提示你输入绑定用的**飞书邮箱或手机号**，服务端查到 `open_id` 后主动给机器人发一条消息，拿到私聊 `chat_id` 完成绑定（需要 `contact:user.id:readonly`）。
+如果 90 秒内没检测到（飞书有些租户不会把私聊会话列出来），会在同一个步骤里回退：提示你输入**飞书邮箱或手机号**，服务端查到 `open_id` 后主动发消息拿 `chat_id`。
 
-也可以随时手动重绑（`--reset` 会先忘掉当前的 owner/私聊，再重新扫码）：
+**重新绑定 / 换账号**：重新运行 `promptsync server`，在"直接使用已有配置启动？"处选 `n` 进入向导，第 4 步会重新走绑定流程。没有单独的绑定命令。
 
-```bash
-promptsync feishu-bind
-promptsync feishu-bind --reset
-```
-
-非交互环境（systemd/launchd/`--non-interactive`）不会阻塞等待，只打印链接和提示；之后在终端里跑一次 `feishu-bind` 即可。
+非交互环境（systemd/launchd/`--non-interactive`）不会进入向导；需要绑定时在终端里手动跑一次 `promptsync server` 即可。
 
 ### 5.3 用飞书私聊覆盖服务端 prompt（控制通道）
 
@@ -473,7 +464,7 @@ cargo build --release
 | `bundle too large` | 调大 `sync.max_bundle_bytes`（单条加密消息上限约 4.4 MiB，base64 后实际可传约 3 MiB） |
 | 时间戳相关错误 | 两端系统时钟偏差：敲门容忍 ±60s，握手 ±600s，先校时（NTP） |
 | 端口被占用 | `server.port` 与其他服务冲突；数据端口只在敲门后绑定，但配置端口仍需唯一 |
-| 飞书绑定一直超时 | 有些租户不会返回私聊会话；等 90 秒后用邮箱/手机号回退，或直接 `promptsync feishu-bind` |
+| 飞书绑定一直超时 | 有些租户不会返回私聊会话；等 90 秒后用邮箱/手机号回退，或重新运行 `server` 进入向导再试 |
 | 飞书返回 99991663 / permission denied | `app_id`/`app_secret` 不对，或应用没发布、没授予 `im:message:readonly` / `im:message:send_as_bot` |
 | 发消息没反应 | 必须是在**绑定的私聊**里由你本人发**纯文本**；群聊、他人、富文本都会被忽略（日志里有原因） |
 | 覆盖后 agent 没更新 | 确认 `sync.target` 指向的文件确实在 server 的 source glob 内，且 `promptsync status` 的 hash 已变化 |

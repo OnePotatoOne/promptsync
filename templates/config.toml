@@ -65,7 +65,7 @@ repeat_alert_secs = 0
 # 飞书开放平台 -> 企业自建应用 -> 凭证与基础信息
 app_id = ""
 app_secret = ""
-# 首次启动 `promptsync server` / `promptsync feishu-bind` 会扫码绑定并自动填写
+# 首次启动 `promptsync server` 的向导第 4 步会扫码绑定并自动填写
 owner_open_id = ""
 # 测试时可改为本地 mock 地址
 api_base = "https://open.feishu.cn"

@@ -13,7 +13,7 @@ use promptsync::knock::{agent_ports, server_ports};
 use promptsync::logx::{Level, Logger};
 use promptsync::paths::Paths;
 use promptsync::prompts::{canonical_hash, resolve_sources, scan, total_bytes, ScanOptions};
-use promptsync::{agent, feishu, feishu_control, server};
+use promptsync::{agent, feishu, server};
 
 #[derive(Parser)]
 #[command(
@@ -99,12 +99,6 @@ enum Command {
         #[arg(long, default_value = "")]
         text: String,
     },
-    /// (Re)bind the Feishu bot: scan the QR code / open the link, then message it
-    FeishuBind {
-        /// Forget the current owner/chat and bind again from scratch
-        #[arg(long)]
-        reset: bool,
-    },
     /// Print the effective configuration
     ConfigFile,
 }
@@ -145,14 +139,6 @@ async fn dispatch(cli: Cli) -> Result<u8> {
         _ => true,
     };
     let prompter = Prompter::new(!cli.non_interactive && !explicit_override);
-    let role = match &cli.command {
-        Command::Server { .. } => Some(Role::Server),
-        Command::Agent { .. } => Some(Role::Agent),
-        _ => None,
-    };
-    if let Some(role) = role {
-        config = interactive::prepare(&paths, config, created, role, &prompter)?;
-    }
 
     match &cli.command {
         Command::Server { bind, port } => {
@@ -164,44 +150,21 @@ async fn dispatch(cli: Cli) -> Result<u8> {
             }
             let logger = make_logger(&config, &paths, "server", cli.log_level.as_deref())?;
             log_paths(&logger, &paths, created);
-            if config.sync.target.trim().is_empty() {
-                match feishu_control::auto_detect_target(&mut config, &paths, &prompter, &logger) {
-                    Ok(Some(target)) => logger.info(format!("managed prompt file: {target}")),
-                    Ok(None) => logger.warn("sync.target is not set; single-file mode is off"),
-                    Err(err) => logger.warn(format!("detecting sync.target failed: {err:#}")),
+            match interactive::prepare(&paths, config, created, Role::Server, &prompter, &logger)? {
+                Some(prepared) => config = prepared,
+                None => {
+                    println!("已取消启动，配置保留在 {}", paths.config_file.display());
+                    return Ok(0);
                 }
             }
-            if config.feishu.enabled && config.feishu_app_configured() {
-                let mut bind_config = config.clone();
-                let bind_paths = paths.clone();
-                let bind_logger = logger.clone();
-                let bind_prompter = prompter.clone();
-                let bound = tokio::task::spawn_blocking(move || {
-                    feishu_control::ensure_binding(
-                        &mut bind_config,
-                        &bind_paths,
-                        &bind_prompter,
-                        &bind_logger,
-                        false,
-                    )
-                })
-                .await
-                .context("Feishu binding task")??;
-                match bound {
-                    Some(binding) => {
-                        logger.info(format!(
-                            "Feishu control channel bound to chat {}",
-                            binding.chat_id
-                        ));
-                        if let Ok((reloaded, _)) = paths.load() {
-                            config = reloaded;
-                        }
-                    }
-                    None => logger.warn(
-                        "Feishu control channel is not bound; prompts can still be edited locally",
-                    ),
-                }
+            // Explicit CLI overrides win over anything the wizard wrote.
+            if let Some(bind) = bind {
+                config.server.bind = bind.clone();
             }
+            if let Some(port) = port {
+                config.server.port = *port;
+            }
+            logger.info(format!("configuration: {}", paths.config_file.display()));
             tokio::select! {
                 result = server::run(config, logger.clone(), paths.data_dir()) => result?,
                 _ = shutdown_signal() => logger.info("shutdown signal received"),
@@ -221,6 +184,20 @@ async fn dispatch(cli: Cli) -> Result<u8> {
             }
             let logger = make_logger(&config, &paths, "agent", cli.log_level.as_deref())?;
             log_paths(&logger, &paths, created);
+            match interactive::prepare(&paths, config, created, Role::Agent, &prompter, &logger)? {
+                Some(prepared) => config = prepared,
+                None => {
+                    println!("已取消启动，配置保留在 {}", paths.config_file.display());
+                    return Ok(0);
+                }
+            }
+            if let Some(host) = host {
+                config.agent.server = host.clone();
+            }
+            if let Some(port) = port {
+                config.agent.port = *port;
+            }
+            logger.info(format!("configuration: {}", paths.config_file.display()));
             if *once {
                 return agent::run_once(config, logger, paths.data_dir()).await;
             }
@@ -238,45 +215,6 @@ async fn dispatch(cli: Cli) -> Result<u8> {
             set,
         } => secret(&mut config, &paths, *show, *generate, set.as_deref()),
         Command::FeishuTest { text } => feishu_test(&config, text).await,
-        Command::FeishuBind { reset } => {
-            if !config.feishu.enabled {
-                bail!("feishu.enabled is false in {}", paths.config_file.display());
-            }
-            if !config.feishu_app_configured() {
-                bail!(
-                    "feishu.app.app_id / app_secret are empty; create a Feishu app and fill them in {}",
-                    paths.config_file.display()
-                );
-            }
-            if *reset {
-                feishu_control::reset_binding(&mut config, &paths)?;
-            }
-            let logger = make_logger(&config, &paths, "feishu", cli.log_level.as_deref())?;
-            let mut bind_config = config.clone();
-            let bind_paths = paths.clone();
-            let bind_prompter = prompter.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                feishu_control::ensure_binding(
-                    &mut bind_config,
-                    &bind_paths,
-                    &bind_prompter,
-                    &logger,
-                    true,
-                )
-            })
-            .await
-            .context("Feishu binding task")??;
-            match result {
-                Some(binding) => {
-                    println!(
-                        "bound: chat_id={} open_id={}",
-                        binding.chat_id, binding.open_id
-                    )
-                }
-                None => println!("Feishu binding was not completed"),
-            }
-            Ok(0)
-        }
         Command::ConfigFile => {
             println!("# config dir:  {}", paths.config_dir.display());
             println!("# config file: {}", paths.config_file.display());
@@ -586,7 +524,9 @@ async fn feishu_test(config: &Config, text: &str) -> Result<u8> {
         bail!("feishu.app.app_id / app_secret are empty; create a Feishu app first");
     }
     if !config.feishu_bound() {
-        bail!("the Feishu owner is not bound yet; run `promptsync feishu-bind`");
+        bail!(
+            "the Feishu owner is not bound yet; run `promptsync server` once in a terminal to bind"
+        );
     }
     let message = if text.trim().is_empty() {
         format!(

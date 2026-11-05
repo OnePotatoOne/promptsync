@@ -173,7 +173,7 @@ pub async fn run(config: Config, logger: Logger, data_dir: std::path::PathBuf) -
                 Err(err) => logger.error(format!("Feishu control disabled: {err:#}")),
             }
         } else {
-            logger.warn("Feishu control disabled: bot is not bound (run `promptsync feishu-bind`)");
+            logger.warn("Feishu control disabled: bot is not bound (re-run `promptsync server` and answer no to reconfigure)");
         }
     } else if !state.config.sync.target.trim().is_empty() {
         logger.info("Feishu control disabled (feishu.enabled = false)");

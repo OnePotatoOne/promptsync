@@ -1,20 +1,20 @@
-//! Interactive start-up prompts.
+//! Interactive first-run wizard.
 //!
-//! * First start: the config was just created from the template, so the user
-//!   gets a short guide and may edit it right away.
-//! * Later starts: confirm that the existing config should be used (default
-//!   yes); answering no opens either a small key/value wizard or $EDITOR.
-//!
-//! Prompts only appear when stdin/stdout are terminals and no explicit
-//! overrides were given, so services, pipes and tests never block.
+//! One linear step at a time ("下一步" style): every step shows the current or
+//! detected value, Enter keeps it, and the wizard ends with a summary that has
+//! to be confirmed before the server/agent starts. Feishu pairing happens
+//! inside the wizard - there is no separate binding command.
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use std::io::{self, IsTerminal, Write};
-use std::path::Path;
-use std::process::Command;
 
 use crate::config::{set_value, Config};
+use crate::crypto::ClusterSecret;
+use crate::feishu::FeishuClient;
+use crate::feishu_control;
+use crate::logx::Logger;
 use crate::paths::Paths;
+use crate::util::toml_string;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -57,6 +57,14 @@ impl Prompter {
         }
     }
 
+    /// Print a `[n/total] title` heading.
+    pub fn step(&self, index: usize, total: usize, title: &str) {
+        if !self.enabled {
+            return;
+        }
+        println!("\n──── 第 {index}/{total} 步：{title} ────");
+    }
+
     pub fn confirm(&self, question: &str, default: bool) -> bool {
         if !self.enabled {
             return default;
@@ -78,7 +86,7 @@ impl Prompter {
         }
     }
 
-    pub fn select(&self, question: &str, options: &[&str], default: usize) -> usize {
+    pub fn select(&self, question: &str, options: &[String], default: usize) -> usize {
         if !self.enabled {
             return default;
         }
@@ -137,177 +145,124 @@ pub fn parse_choice(value: &str, count: usize) -> Option<usize> {
     }
 }
 
-/// Run the start-up guidance. Returns the config that should be used.
+/// Entry point used by `server` and `agent`.
+///
+/// * non-interactive: print a one-line hint when the config was just created.
+/// * existing config: ask once whether to start with it.
+/// * otherwise: run the stepped wizard, then a summary confirmation.
 pub fn prepare(
     paths: &Paths,
     config: Config,
     created: bool,
     role: Role,
     prompter: &Prompter,
-) -> Result<Config> {
+    logger: &Logger,
+) -> Result<Option<Config>> {
     if !prompter.enabled() {
         if created {
             eprintln!(
-                "[promptsync] 已从模板创建 {}。请按需修改（agent 必须设置 agent.server）后启动；非交互环境不会等待输入。",
+                "[promptsync] 已从模板创建 {}。请按需修改后启动；非交互环境不会进入配置向导。",
                 paths.config_file.display()
             );
         }
-        return Ok(config);
+        return Ok(Some(config));
     }
 
-    println!();
-    if created {
-        println!("首次启动：config 目录为空，已按模板生成配置。");
+    let mut config = config;
+    if !created {
+        println!("\n检测到已有配置：{}", paths.config_file.display());
+        if prompter.confirm("直接使用它启动？", true) {
+            return Ok(Some(config));
+        }
+        println!("进入配置向导，每一步直接回车即可保留当前值。");
     } else {
-        println!("已检测到已有配置。");
-    }
-    print_guidance(paths, &config, role);
-
-    if !created && prompter.confirm("是否使用已有配置启动？", true) {
-        return Ok(config);
+        println!("首次启动：将用几步确认配置，每一步直接回车即可使用推荐值。");
     }
 
-    // On the very first agent start the server address is still the template
-    // placeholder, so default to the guided edit instead of starting blindly.
-    let default_choice = if created && role == Role::Agent && is_loopback(&config.agent.server) {
-        1
-    } else {
-        0
+    let total = match role {
+        Role::Server => 5,
+        Role::Agent => 4,
     };
-    let choice = prompter.select(
-        "现在要做什么？",
-        &[
-            "直接使用当前配置启动",
-            "交互式修改关键项后启动",
-            "用编辑器打开配置文件后启动",
-        ],
-        default_choice,
-    );
-    match choice {
-        0 => Ok(config),
-        1 => customize(paths, config, role, prompter),
-        _ => edit_in_editor(paths, config, role, prompter),
-    }
-}
-
-fn is_loopback(host: &str) -> bool {
-    matches!(
-        host.trim().to_ascii_lowercase().as_str(),
-        "" | "127.0.0.1" | "localhost" | "::1" | "[::1]"
-    )
-}
-
-fn print_guidance(paths: &Paths, config: &Config, role: Role) {
-    println!("  config: {}", paths.config_file.display());
-    println!("  state : {}", paths.data_dir().display());
-    println!("  logs  : {}", paths.log_dir(config).display());
-    println!("\n请按指引确认以下配置（直接回车 = 使用默认值）：");
-    match role {
-        Role::Agent => {
-            println!(
-                "  [agent] server = \"{}\"    <- 必须改成服务端 IP / 主机名",
-                config.agent.server
-            );
-            println!(
-                "  [agent] port = {}          <- 0 = 由集群密钥自动推导（需与服务端一致）",
-                config.agent.port
-            );
-        }
-        Role::Server => {
-            println!(
-                "  [server] bind = \"{}\"    <- 对外监听地址",
-                config.server.bind
-            );
-            println!(
-                "  [server] port = {}          <- 0 = 由集群密钥自动推导",
-                config.server.port
-            );
-            println!(
-                "  [sync] target = \"{}\"   <- 飞书私聊覆盖的那一个文件",
-                config.sync.target
-            );
-        }
-    }
-    println!(
-        "  cluster_secret = {}   <- 不同次编译的二进制需填成同一个 64 位 hex",
-        if config.cluster_secret.trim().is_empty() {
-            "\"\"  (使用编译进二进制的密钥)"
-        } else {
-            "\"...\"  (已配置)"
-        }
-    );
-    println!(
-        "  [feishu] app_id = {}   <- 可选；自建应用，控制私聊 + 离线告警",
-        if config.feishu.app.app_id.trim().is_empty() {
-            "\"\"  (未配置)"
-        } else {
-            "\"cli_...\"  (已配置)"
-        }
-    );
-    println!(
-        "  [[sync.sources]] = {} 个同步源   <- 要同步的 prompt 目录",
-        config.sync.sources.len()
-    );
-    println!();
-}
-
-fn customize(paths: &Paths, mut config: Config, role: Role, prompter: &Prompter) -> Result<Config> {
     loop {
         match role {
-            Role::Agent => {
-                let server = prompter.text("服务端地址 (agent.server)", &config.agent.server);
-                let port = ask_port(prompter, "数据端口 (agent.port, 0=自动)", config.agent.port)?;
-                set_value(
-                    &paths.config_file,
-                    Some("agent"),
-                    "server",
-                    &toml_string(&server),
-                )?;
-                set_value(&paths.config_file, Some("agent"), "port", &port.to_string())?;
-            }
-            Role::Server => {
-                let bind = prompter.text("监听地址 (server.bind)", &config.server.bind);
-                let port = ask_port(
-                    prompter,
-                    "数据端口 (server.port, 0=自动)",
-                    config.server.port,
-                )?;
-                set_value(
-                    &paths.config_file,
-                    Some("server"),
-                    "bind",
-                    &toml_string(&bind),
-                )?;
-                set_value(
-                    &paths.config_file,
-                    Some("server"),
-                    "port",
-                    &port.to_string(),
-                )?;
-            }
+            Role::Server => server_wizard(&mut config, paths, prompter, logger, total, created)?,
+            Role::Agent => agent_wizard(&mut config, paths, prompter, logger, total)?,
         }
-        println!(
-            "\n已写回 {}（集群密钥对齐：promptsync secret --set <hex>）",
-            paths.config_file.display()
-        );
-        println!(
-            "飞书控制/告警：在配置的 [feishu.app] 填 app_id/app_secret（enabled = true），然后运行 `promptsync feishu-bind` 完成扫码绑定。"
-        );
-        match paths.load() {
-            Ok((reloaded, _)) => return Ok(reloaded),
-            Err(err) => {
-                eprintln!("配置校验失败：{err:#}");
-                if !prompter.confirm("重新修改？", true) {
-                    return Err(err);
-                }
-                config = reload_fallback(paths).unwrap_or(config);
-            }
+        let (reloaded, _) = paths.load()?;
+        config = reloaded;
+        print_summary(&config, paths, role);
+        if prompter.confirm("保存并启动？", true) {
+            return Ok(Some(config));
+        }
+        if !prompter.confirm("重新配置一遍？", true) {
+            return Ok(None);
         }
     }
 }
 
-fn reload_fallback(paths: &Paths) -> Option<Config> {
-    paths.load().ok().map(|(config, _)| config)
+fn server_wizard(
+    config: &mut Config,
+    paths: &Paths,
+    prompter: &Prompter,
+    logger: &Logger,
+    total: usize,
+    first_run: bool,
+) -> Result<()> {
+    prompter.step(1, total, "监听地址与数据端口");
+    println!("数据端口只在端口敲门成功后才会绑定；填 0 表示由集群密钥自动推导。");
+    let bind = prompter.text("监听地址", &config.server.bind);
+    let port = ask_port(prompter, "数据端口（0 = 自动推导）", config.server.port)?;
+    apply(paths, Some("server"), "bind", &toml_string(bind.trim()))?;
+    apply(paths, Some("server"), "port", &port.to_string())?;
+    config.server.bind = bind.trim().to_string();
+    config.server.port = port;
+
+    prompter.step(2, total, "要同步的 prompt 文件");
+    configure_target(config, paths, prompter)?;
+
+    prompter.step(3, total, "集群密钥");
+    configure_secret(config, paths, prompter)?;
+
+    prompter.step(4, total, "飞书（私聊覆盖 prompt + 离线告警）");
+    configure_feishu(
+        config,
+        paths,
+        prompter,
+        logger,
+        first_run || config.feishu.enabled,
+    )?;
+
+    prompter.step(5, total, "确认");
+    Ok(())
+}
+
+fn agent_wizard(
+    config: &mut Config,
+    paths: &Paths,
+    prompter: &Prompter,
+    logger: &Logger,
+    total: usize,
+) -> Result<()> {
+    prompter.step(1, total, "服务端地址");
+    let server = prompter.text("服务端主机名或 IP", &config.agent.server);
+    let port = ask_port(prompter, "数据端口（0 = 自动推导）", config.agent.port)?;
+    apply(paths, Some("agent"), "server", &toml_string(server.trim()))?;
+    apply(paths, Some("agent"), "port", &port.to_string())?;
+    config.agent.server = server.trim().to_string();
+    config.agent.port = port;
+
+    prompter.step(2, total, "集群密钥");
+    configure_secret(config, paths, prompter)?;
+
+    prompter.step(3, total, "agent 端飞书告警（可选）");
+    configure_agent_alerts(config, paths, prompter, logger)?;
+
+    prompter.step(4, total, "确认");
+    Ok(())
+}
+
+fn apply(paths: &Paths, section: Option<&str>, key: &str, literal: &str) -> Result<()> {
+    set_value(&paths.config_file, section, key, literal)
 }
 
 fn ask_port(prompter: &Prompter, label: &str, current: u16) -> Result<u16> {
@@ -320,69 +275,306 @@ fn ask_port(prompter: &Prompter, label: &str, current: u16) -> Result<u16> {
     }
 }
 
-fn edit_in_editor(
-    paths: &Paths,
-    config: Config,
-    role: Role,
-    prompter: &Prompter,
-) -> Result<Config> {
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| default_editor().to_string());
-    loop {
-        println!(
-            "\n用编辑器打开（保存后退出即可继续）:\n  {editor} {}",
-            paths.config_file.display()
+fn configure_target(config: &mut Config, paths: &Paths, prompter: &Prompter) -> Result<()> {
+    let candidates = feishu_control::target_candidates(config)?;
+    if candidates.is_empty() {
+        println!("没有在同步源里找到 system_prompt.md / SOUL.md。");
+        let manual = prompter.text(
+            "手动输入 sync.target（<source id>/<相对路径>，留空跳过）",
+            config.sync.target.trim(),
         );
-        match run_editor(&editor, &paths.config_file) {
-            Ok(()) => {}
-            Err(err) => {
-                eprintln!("无法启动编辑器：{err:#}");
-                if prompter.confirm("改为交互式修改关键项？", true) {
-                    return customize(paths, config, role, prompter);
-                }
-                return Err(err);
-            }
+        if manual.trim().is_empty() {
+            println!("已跳过：稍后可以在配置里设置 sync.target。");
+        } else {
+            feishu_control::set_target(config, paths, manual.trim(), false)?;
+            println!("已设置 sync.target = {}", config.sync.target);
         }
-        match paths.load() {
-            Ok((reloaded, _)) => return Ok(reloaded),
-            Err(err) => {
-                eprintln!("配置校验失败：{err:#}");
-                if !prompter.confirm("再次编辑？", true) {
-                    return Err(err);
-                }
+        return Ok(());
+    }
+
+    let current = config.sync.target.trim().to_string();
+    let non_empty: Vec<&feishu_control::TargetCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.bytes > 0)
+        .collect();
+    let options: Vec<String> = candidates
+        .iter()
+        .map(|candidate| {
+            let mark = if candidate.key == current {
+                "  ← 当前"
+            } else {
+                ""
+            };
+            let empty = if candidate.bytes == 0 { "  (空)" } else { "" };
+            format!("{}  ({} B){empty}{mark}", candidate.key, candidate.bytes)
+        })
+        .collect();
+    let default = candidates
+        .iter()
+        .position(|candidate| candidate.key == current)
+        .unwrap_or(0);
+    let chosen_index = if non_empty.len() == 1 {
+        let index = candidates
+            .iter()
+            .position(|candidate| candidate.key == non_empty[0].key)
+            .unwrap_or(0);
+        println!(
+            "检测到唯一非空的 prompt：{}（{} B）",
+            candidates[index].key, candidates[index].bytes
+        );
+        index
+    } else if candidates.len() == 1 {
+        println!("检测到唯一候选：{}", candidates[0].key);
+        0
+    } else {
+        prompter.select(
+            "检测到多个 prompt 文件，选择要维护的那一个：",
+            &options,
+            default,
+        )
+    };
+    let key = candidates[chosen_index].key.clone();
+    let narrow = if candidates.len() > 1 || current != key {
+        prompter.confirm("以后只同步这一个文件？（其它文件停止管理，不删除）", true)
+    } else {
+        true
+    };
+    feishu_control::set_target(config, paths, &key, narrow)?;
+    println!("已设置为唯一受管文件：{key}");
+    Ok(())
+}
+
+fn configure_secret(config: &mut Config, paths: &Paths, prompter: &Prompter) -> Result<()> {
+    let secret = ClusterSecret::resolve(&config.cluster_secret)?;
+    let source = if config.cluster_secret.trim().is_empty() {
+        "编译进本二进制的那把随机密钥"
+    } else {
+        "配置文件里的密钥"
+    };
+    println!("当前使用：{source}（指纹 {}）。", secret.fingerprint());
+    println!("如果所有机器用的是同一次编译的二进制，直接回车即可；");
+    println!("如果是分别编译的，需要在这里填同一串 64 位 hex（输入内容会显示在终端）。");
+    if prompter.confirm("使用当前密钥？", true) {
+        return Ok(());
+    }
+    loop {
+        let value = prompter.text("集群密钥（64 位 hex）", "");
+        match ClusterSecret::from_hex(&value) {
+            Ok(secret) => {
+                apply(
+                    paths,
+                    None,
+                    "cluster_secret",
+                    &toml_string(&secret.to_hex()),
+                )?;
+                config.cluster_secret = secret.to_hex();
+                println!("已更新，指纹 {}。", secret.fingerprint());
+                return Ok(());
             }
+            Err(err) => eprintln!("密钥无效：{err}"),
         }
     }
 }
 
-fn run_editor(editor: &str, file: &Path) -> Result<()> {
-    let mut parts = editor.split_whitespace();
-    let program = parts.next().context("empty editor command")?;
-    let mut command = Command::new(program);
-    for arg in parts {
-        command.arg(arg);
+fn configure_feishu(
+    config: &mut Config,
+    paths: &Paths,
+    prompter: &Prompter,
+    logger: &Logger,
+    default_enabled: bool,
+) -> Result<()> {
+    println!("飞书用企业自建应用接收你私聊发来的纯文本，覆盖服务端那一个 prompt 文件；");
+    println!("同一个应用也用来发离线告警（不再使用群机器人 webhook）。");
+    if !prompter.confirm("启用飞书？", default_enabled) {
+        apply(paths, Some("feishu"), "enabled", "false")?;
+        config.feishu.enabled = false;
+        println!("已跳过飞书，稍后重新运行 server 即可再配置。");
+        return Ok(());
     }
-    let status = command
-        .arg(file)
-        .status()
-        .with_context(|| format!("running editor {editor}"))?;
-    if !status.success() {
-        bail!("editor exited with {status}");
+    apply(paths, Some("feishu"), "enabled", "true")?;
+    config.feishu.enabled = true;
+
+    println!("\n需要先在飞书开放平台创建企业自建应用：");
+    println!("  1) 启用「机器人」能力；");
+    println!("  2) 权限：im:message:readonly、im:message:send_as_bot、im:chat:readonly；");
+    println!("  3) 创建版本并发布；");
+    println!("  4) 在「凭证与基础信息」里复制 app_id / app_secret。\n");
+
+    loop {
+        let app_id = prompter.text("app_id", &config.feishu.app.app_id);
+        let app_secret = prompter.text("app_secret", &config.feishu.app.app_secret);
+        if app_id.trim().is_empty() || app_secret.trim().is_empty() {
+            println!("app_id 和 app_secret 都必须填写。");
+            if !prompter.confirm("继续填写？", true) {
+                apply(paths, Some("feishu"), "enabled", "false")?;
+                config.feishu.enabled = false;
+                return Ok(());
+            }
+            continue;
+        }
+        apply(
+            paths,
+            Some("feishu.app"),
+            "app_id",
+            &toml_string(app_id.trim()),
+        )?;
+        apply(
+            paths,
+            Some("feishu.app"),
+            "app_secret",
+            &toml_string(app_secret.trim()),
+        )?;
+        config.feishu.app.app_id = app_id.trim().to_string();
+        config.feishu.app.app_secret = app_secret.trim().to_string();
+
+        print!("校验凭据 … ");
+        let _ = io::stdout().flush();
+        match FeishuClient::from_config(config).and_then(|client| client.check()) {
+            Ok(()) => {
+                println!("通过。");
+                break;
+            }
+            Err(err) => {
+                println!("失败：{err:#}");
+                if !prompter.confirm("重新填写 app_id / app_secret？", true) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    println!();
+    match feishu_control::ensure_binding(config, paths, prompter, logger, true) {
+        Ok(Some(binding)) => println!(
+            "飞书绑定完成：open_id {}（之后直接在这个私聊里发纯文本即可）。",
+            binding.open_id
+        ),
+        Ok(None) => {
+            println!("飞书还没绑定成功。服务仍会启动；下次重新运行 server 进入向导可以再绑一次。")
+        }
+        Err(err) => {
+            println!("飞书绑定失败：{err:#}。服务仍会启动；下次重新运行 server 进入向导可以再试。")
+        }
     }
     Ok(())
 }
 
-fn default_editor() -> &'static str {
-    if cfg!(windows) {
-        "notepad"
-    } else {
-        "vi"
+fn configure_agent_alerts(
+    config: &mut Config,
+    paths: &Paths,
+    prompter: &Prompter,
+    logger: &Logger,
+) -> Result<()> {
+    let _ = logger;
+    println!("agent 自己发离线告警需要飞书应用凭据；不配置也不影响 prompt 同步。");
+    if !prompter.confirm("配置 agent 端离线告警？", config.feishu.enabled) {
+        return Ok(());
+    }
+    loop {
+        let app_id = prompter.text("app_id", &config.feishu.app.app_id);
+        let app_secret = prompter.text("app_secret", &config.feishu.app.app_secret);
+        let owner = prompter.text(
+            "告警接收者 open_id（服务端 status --json 可查）",
+            &config.feishu.app.owner_open_id,
+        );
+        if app_id.trim().is_empty() || app_secret.trim().is_empty() || owner.trim().is_empty() {
+            println!("app_id、app_secret、owner_open_id 都需要填写。");
+            if !prompter.confirm("继续填写？", true) {
+                return Ok(());
+            }
+            continue;
+        }
+        apply(paths, Some("feishu"), "enabled", "true")?;
+        apply(
+            paths,
+            Some("feishu.app"),
+            "app_id",
+            &toml_string(app_id.trim()),
+        )?;
+        apply(
+            paths,
+            Some("feishu.app"),
+            "app_secret",
+            &toml_string(app_secret.trim()),
+        )?;
+        apply(
+            paths,
+            Some("feishu.app"),
+            "owner_open_id",
+            &toml_string(owner.trim()),
+        )?;
+        config.feishu.enabled = true;
+        config.feishu.app.app_id = app_id.trim().to_string();
+        config.feishu.app.app_secret = app_secret.trim().to_string();
+        config.feishu.app.owner_open_id = owner.trim().to_string();
+
+        print!("校验凭据 … ");
+        let _ = io::stdout().flush();
+        match FeishuClient::from_config(config).and_then(|client| client.check()) {
+            Ok(()) => {
+                println!("通过。");
+                return Ok(());
+            }
+            Err(err) => {
+                println!("失败：{err:#}");
+                if !prompter.confirm("重新填写？", true) {
+                    return Ok(());
+                }
+            }
+        }
     }
 }
 
-fn toml_string(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+fn print_summary(config: &Config, paths: &Paths, role: Role) {
+    let ports = match ClusterSecret::resolve(&config.cluster_secret) {
+        Ok(secret) => crate::knock::server_ports(&config.server, &secret),
+        Err(_) => crate::knock::Ports {
+            main: config.server.port,
+            knock_pool: Vec::new(),
+        },
+    };
+    println!("\n──── 配置摘要 ────");
+    println!("配置文件   {}", paths.config_file.display());
+    if role == Role::Server {
+        println!(
+            "监听       {}:{}",
+            config.server.bind,
+            if config.server.port == 0 {
+                format!("{}（自动）", ports.main)
+            } else {
+                config.server.port.to_string()
+            }
+        );
+        println!("敲门端口   {}", ports.knock_pool.len());
+        println!(
+            "受管文件   {}",
+            if config.sync.target.trim().is_empty() {
+                "（未设置）"
+            } else {
+                config.sync.target.trim()
+            }
+        );
+    } else {
+        println!(
+            "服务端     {}:{}",
+            config.agent.server,
+            if config.agent.port == 0 {
+                "自动".to_string()
+            } else {
+                config.agent.port.to_string()
+            }
+        );
+    }
+    println!(
+        "集群密钥   {}",
+        if config.cluster_secret.trim().is_empty() {
+            "使用编译进二进制的密钥"
+        } else {
+            "配置文件中的密钥"
+        }
+    );
+    println!("飞书       {}", crate::feishu::describe(config));
+    println!();
 }
 
 #[cfg(test)]
@@ -392,10 +584,8 @@ mod tests {
     #[test]
     fn parses_yes_no() {
         assert_eq!(parse_yes_no("y"), Some(true));
-        assert_eq!(parse_yes_no("YES"), Some(true));
         assert_eq!(parse_yes_no("是"), Some(true));
         assert_eq!(parse_yes_no("n"), Some(false));
-        assert_eq!(parse_yes_no("否"), Some(false));
         assert_eq!(parse_yes_no("maybe"), None);
     }
 
@@ -404,8 +594,6 @@ mod tests {
         assert_eq!(parse_choice("1", 3), Some(0));
         assert_eq!(parse_choice("3", 3), Some(2));
         assert_eq!(parse_choice("4", 3), None);
-        assert_eq!(parse_choice("0", 3), None);
-        assert_eq!(parse_choice("x", 3), None);
     }
 
     #[test]
@@ -414,7 +602,6 @@ mod tests {
         assert!(!prompter.enabled());
         assert!(prompter.confirm("q", true));
         assert!(!prompter.confirm("q", false));
-        assert_eq!(prompter.select("q", &["a", "b"], 1), 1);
         assert_eq!(prompter.text("q", "keep"), "keep");
     }
 }

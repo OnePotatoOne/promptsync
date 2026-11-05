@@ -106,20 +106,6 @@ pub fn resolve_target(config: &Config, sources: &[SourceSpec]) -> Result<TargetF
     })
 }
 
-/// Forget the current binding so `feishu-bind --reset` can start over.
-pub fn reset_binding(config: &mut Config, paths: &Paths) -> Result<()> {
-    let path = paths.data_dir().join(BINDING_FILE);
-    let _ = fs::remove_file(path);
-    config.feishu.app.owner_open_id.clear();
-    set_value(
-        &paths.config_file,
-        Some("feishu.app"),
-        "owner_open_id",
-        "\"\"",
-    )?;
-    Ok(())
-}
-
 pub fn load_binding(data_dir: &Path) -> Option<Binding> {
     let path = data_dir.join(BINDING_FILE);
     fs::read_to_string(path)
@@ -150,7 +136,6 @@ pub fn ensure_binding(
     if !config.feishu.enabled {
         return Ok(None);
     }
-    auto_detect_target(config, paths, prompter, logger)?;
     if !config.feishu_app_configured() {
         logger.warn(
             "Feishu is enabled but feishu.app.app_id / app_secret are empty; control channel and alerts are off",
@@ -199,7 +184,7 @@ pub fn ensure_binding(
 
     if !prompter.enabled() {
         logger.warn(format!(
-            "Feishu app is not bound. Open {app_link} in Feishu, send the bot a message, then run `promptsync feishu-bind`."
+            "Feishu app is not bound. Open {app_link} in Feishu, send the bot a message, then re-run `promptsync server` to finish binding."
         ));
         return Ok(None);
     }
@@ -284,98 +269,68 @@ pub fn ensure_binding(
     Ok(Some(binding))
 }
 
-/// When `sync.target` is empty, look for exactly one non-empty
-/// `system_prompt.md`/`SOUL.md` among the configured sources and persist it.
-/// In an interactive session it also offers to narrow the source globs so that
-/// only that one file is synchronised.
-pub fn auto_detect_target(
-    config: &mut Config,
-    paths: &Paths,
-    prompter: &Prompter,
-    logger: &Logger,
-) -> Result<Option<String>> {
-    let configured = config.sync.target.trim().to_string();
-    if !configured.is_empty() {
-        return Ok(Some(configured));
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetCandidate {
+    pub key: String,
+    pub bytes: usize,
+}
+
+/// Candidate prompt files (`system_prompt.md` / `SOUL.md`) from the sources.
+/// Non-empty files come first so the wizard can default to them.
+pub fn target_candidates(config: &Config) -> Result<Vec<TargetCandidate>> {
     let sources = crate::prompts::resolve_sources(&config.sync);
     let options = crate::prompts::ScanOptions::from(&config.sync);
-    let entries = crate::prompts::scan(&sources, &options, Some(logger))?;
-    let candidates: Vec<(String, usize)> = entries
+    let entries = crate::prompts::scan(&sources, &options, None)?;
+    let mut candidates: Vec<TargetCandidate> = entries
         .iter()
         .filter(|(key, _)| key.ends_with("/system_prompt.md") || key.ends_with("/SOUL.md"))
-        .map(|(key, content)| (key.clone(), content.len()))
+        .map(|(key, content)| TargetCandidate {
+            key: key.clone(),
+            bytes: content.len(),
+        })
         .collect();
-    let non_empty: Vec<&(String, usize)> =
-        candidates.iter().filter(|(_, bytes)| *bytes > 0).collect();
-    let chosen = if non_empty.len() == 1 {
-        Some(non_empty[0].0.clone())
-    } else if candidates.len() == 1 {
-        Some(candidates[0].0.clone())
-    } else {
-        None
-    };
-    let Some(chosen) = chosen else {
-        if candidates.is_empty() {
-            logger
-                .warn("no prompt file found; set sync.target manually to enable single-file mode");
-        } else {
-            logger.warn(format!(
-                "several non-empty prompt files match; set sync.target manually (candidates: {:?})",
-                candidates.iter().map(|(key, _)| key).collect::<Vec<_>>()
-            ));
-        }
-        return Ok(None);
-    };
+    candidates.sort_by(|left, right| {
+        right
+            .bytes
+            .cmp(&left.bytes)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    Ok(candidates)
+}
 
+/// Persist `sync.target` and optionally narrow the source globs to that file.
+pub fn set_target(config: &mut Config, paths: &Paths, key: &str, narrow: bool) -> Result<()> {
+    let previous = config.sync.target.clone();
+    config.sync.target = key.to_string();
+    if let Err(err) = || -> Result<()> {
+        let sources = crate::prompts::resolve_sources(&config.sync);
+        resolve_target(config, &sources)?;
+        Ok(())
+    }() {
+        config.sync.target = previous;
+        return Err(err);
+    }
     set_value(
         &paths.config_file,
         Some("sync"),
         "target",
-        &format!("\"{chosen}\""),
+        &format!("\"{key}\""),
     )?;
-    config.sync.target = chosen.clone();
-    logger.info(format!("sync.target auto-detected: {chosen}"));
-
-    let (id, relative) = chosen
-        .split_once('/')
-        .context("auto-detected target has no source id")?;
-    let narrow = config
-        .sync
-        .sources
-        .iter()
-        .find(|source| source.id == id)
-        .map(|source| source.globs.len() != 1 || source.globs[0] != relative)
-        .unwrap_or(false);
     if narrow {
-        let should_narrow = if prompter.enabled() {
-            prompter.confirm(
-                &format!("检测到唯一非空 prompt：{chosen}。以后只同步这一个文件吗？"),
-                true,
-            )
-        } else {
-            false
-        };
-        if should_narrow {
-            set_source_globs(&paths.config_file, id, &[relative.to_string()])?;
-            if let Some(source) = config
-                .sync
-                .sources
-                .iter_mut()
-                .find(|source| source.id == id)
-            {
-                source.globs = vec![relative.to_string()];
-            }
-            logger.info(format!("source {id} narrowed to only {relative}"));
-        } else if prompter.enabled() {
-            logger.info("kept the existing source globs; only sync.target is used by Feishu");
-        } else {
-            logger.warn(format!(
-                "consider narrowing source {id} to [\"{relative}\"] for single-file mode"
-            ));
+        let (id, relative) = key
+            .split_once('/')
+            .context("sync.target has no source id")?;
+        set_source_globs(&paths.config_file, id, &[relative.to_string()])?;
+        if let Some(source) = config
+            .sync
+            .sources
+            .iter_mut()
+            .find(|source| source.id == id)
+        {
+            source.globs = vec![relative.to_string()];
         }
     }
-    Ok(Some(config.sync.target.clone()))
+    Ok(())
 }
 
 fn qr_art(link: &str) -> Option<String> {
@@ -962,6 +917,61 @@ mod tests {
 
         config.sync.target = "nope/x.md".to_string();
         assert!(resolve_target(&config, &sources).is_err());
+    }
+
+    #[test]
+    fn target_candidates_put_non_empty_files_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("owners");
+        let dir = root.join("acme/bots/cindy");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SOUL.md"), "soul content").unwrap();
+        fs::write(dir.join("system_prompt.md"), "").unwrap();
+        let mut config = Config::default();
+        config.sync.sources = vec![crate::config::SourceConfig {
+            id: "cindy".to_string(),
+            root: root.display().to_string(),
+            globs: vec![
+                "*/bots/*/system_prompt.md".to_string(),
+                "*/bots/*/SOUL.md".to_string(),
+            ],
+        }];
+        let candidates = target_candidates(&config).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates[0].key.ends_with("SOUL.md"));
+        assert!(candidates[0].bytes > 0);
+        assert_eq!(candidates[1].bytes, 0);
+    }
+
+    #[test]
+    fn set_target_persists_and_narrows_globs() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::resolve(None, Some(temp.path())).unwrap();
+        let root = temp.path().join("owners");
+        let dir = root.join("acme/bots/cindy");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SOUL.md"), "soul").unwrap();
+        let text = format!(
+            "[sync]\ntarget = \"\"\n[[sync.sources]]\nid = \"cindy\"\nroot = \"{}\"\nglobs = [\"*/bots/*/system_prompt.md\", \"*/bots/*/SOUL.md\"]\n",
+            root.display()
+        );
+        fs::write(&paths.config_file, &text).unwrap();
+        let mut config: Config = toml::from_str(&text).unwrap();
+        let key = "cindy/acme/bots/cindy/SOUL.md";
+        set_target(&mut config, &paths, key, true).unwrap();
+        assert_eq!(config.sync.target, key);
+        assert_eq!(
+            config.sync.sources[0].globs,
+            vec!["acme/bots/cindy/SOUL.md"]
+        );
+        let reloaded: Config =
+            toml::from_str(&fs::read_to_string(&paths.config_file).unwrap()).unwrap();
+        assert_eq!(reloaded.sync.target, key);
+        assert_eq!(
+            reloaded.sync.sources[0].globs,
+            vec!["acme/bots/cindy/SOUL.md"]
+        );
+        assert!(set_target(&mut config, &paths, "cindy/../escape.md", true).is_err());
     }
 
     #[test]

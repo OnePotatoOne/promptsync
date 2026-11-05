@@ -453,7 +453,7 @@ pub fn notify_blocking(config: &Config, text: &str) -> Result<()> {
     }
     let owner = config.feishu.app.owner_open_id.trim();
     if owner.is_empty() {
-        bail!("Feishu owner is not bound yet (run `promptsync feishu-bind`)");
+        bail!("Feishu owner is not bound yet (bind it from the `promptsync server` wizard)");
     }
     let client = FeishuClient::from_config(config)?;
     client.send_text_to_owner(owner, text)?;
