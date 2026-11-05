@@ -1,0 +1,34 @@
+# personal configuration directory (created on first start; never commit it)
+/config/
+
+# build output
+/target
+target/
+
+# local secrets: Feishu webhook, pinned cluster secret, anything private.
+# This directory is never part of the repository.
+/secrets/
+
+# local configuration / runtime state (normally stored outside the repo)
+/config.toml
+/agent-state.json
+/agents.json
+/managed.json
+/backups/
+/state/
+*.psync.tmp
+*.log
+*.log.*
+/logs/
+
+# credentials and dotenv files
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.secret
+
+# OS noise
+.DS_Store
+Thumbs.db

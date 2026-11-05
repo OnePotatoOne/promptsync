@@ -1,0 +1,17 @@
+[Unit]
+Description=promptsync agent (polls the prompt server)
+Documentation=https://github.com/makecindy/promptsync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__PROJECT_DIR__
+ExecStart=__BIN__ agent --config-dir __CONFIG_DIR__ --non-interactive
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

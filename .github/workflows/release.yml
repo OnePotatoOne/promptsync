@@ -1,0 +1,136 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # One cluster secret for the whole workflow run so that every platform of this
+  # release can talk to every other one. Nothing fixed is stored in the repo.
+  prepare:
+    name: prepare secrets
+    runs-on: ubuntu-latest
+    outputs:
+      secret: ${{ steps.secret.outputs.secret }}
+    steps:
+      - name: Derive cluster secret
+        id: secret
+        env:
+          FROM_REPO: ${{ secrets.PROMPTSYNC_CLUSTER_SECRET }}
+        run: |
+          set -euo pipefail
+          secret="${FROM_REPO:-}"
+          if [ -z "$secret" ]; then
+            secret="$(openssl rand -hex 32)"
+            echo "::notice::PROMPTSYNC_CLUSTER_SECRET is not configured; generated a random secret for this release."
+          fi
+          secret="$(printf '%s' "$secret" | tr 'A-F' 'a-f' | tr -d '[:space:]')"
+          if ! printf '%s' "$secret" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "PROMPTSYNC_CLUSTER_SECRET must be exactly 64 hex characters" >&2
+            exit 1
+          fi
+          echo "::add-mask::$secret"
+          printf 'secret=%s\n' "$secret" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            name: promptsync-linux-x86_64
+            archive: tar.gz
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            name: promptsync-linux-x86_64-musl
+            archive: tar.gz
+          - os: macos-14
+            target: x86_64-apple-darwin
+            name: promptsync-macos-x86_64
+            archive: tar.gz
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            name: promptsync-windows-x86_64
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    env:
+      PROMPTSYNC_BUILD_SECRET: ${{ needs.prepare.outputs.secret }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="${{ matrix.name }}"
+          target="${{ matrix.target }}"
+          staging="dist/$name"
+          mkdir -p "$staging/packaging/systemd" "$staging/packaging/launchd"
+          cp "target/$target/release/promptsync" "$staging/"
+          cp README.md LICENSE "$staging/"
+          cp -R templates "$staging/"
+          cp packaging/systemd/*.service.in "$staging/packaging/systemd/"
+          cp packaging/launchd/*.plist "$staging/packaging/launchd/"
+          cp packaging/install.sh "$staging/packaging/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $name = "${{ matrix.name }}"
+          $target = "${{ matrix.target }}"
+          $staging = "dist/$name"
+          New-Item -ItemType Directory -Force -Path "$staging/packaging/systemd" | Out-Null
+          Copy-Item "target/$target/release/promptsync.exe" "$staging/"
+          Copy-Item README.md, LICENSE "$staging/"
+          Copy-Item -Recurse templates "$staging/"
+          Copy-Item packaging/systemd/*.service.in "$staging/packaging/systemd/"
+          Copy-Item packaging/install.sh "$staging/packaging/"
+          Compress-Archive -Path "$staging/*" -DestinationPath "dist/$name.zip" -Force
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/${{ matrix.name }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: publish github release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | sort | xargs -r sha256sum > SHA256SUMS
+          cat SHA256SUMS
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
