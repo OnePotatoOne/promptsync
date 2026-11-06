@@ -59,11 +59,12 @@ jobs:
             target: aarch64-unknown-linux-musl
             name: promptsync-linux-aarch64-musl
             ext: ""
-          - os: macos-14
+          # macOS 14 runners were retired on 2026-11-02; use macOS 15.
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             name: promptsync-macos-x86_64
             ext: ""
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             name: promptsync-macos-aarch64
             ext: ""
