@@ -489,6 +489,7 @@ async fn session_task(
                     files: snapshot.entries.len(),
                     bytes: total_bytes(&snapshot.entries),
                     updated_unix: snapshot.updated_unix,
+                    target: state.config.sync.target.clone(),
                 };
                 if reply(&mut channel, &state.config, &Response::Status(manifest))
                     .await

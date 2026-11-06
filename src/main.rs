@@ -382,6 +382,7 @@ fn status(config: &Config, paths: &Paths, json: bool) -> Result<u8> {
     let sources = resolve_sources(&config.sync);
     let options = ScanOptions::from(&config.sync);
     let entries = scan(&sources, &options, None)?;
+    let client_files = promptsync::adapters::detect(&config.sync);
     let hash = canonical_hash(&entries);
     let bytes = total_bytes(&entries);
     let data_dir = paths.data_dir();
@@ -429,6 +430,14 @@ fn status(config: &Config, paths: &Paths, json: bool) -> Result<u8> {
                 "owner_open_id": config.feishu.app.owner_open_id,
                 "target": config.sync.target,
                 "dry_run": config.feishu.control.dry_run,
+            },
+            "adapters": {
+                "enabled": config.sync.adapt_clients,
+                "targets": client_files.iter().map(|adapter| serde_json::json!({
+                    "id": adapter.id,
+                    "path": adapter.path.display().to_string(),
+                    "exists": adapter.path.is_file(),
+                })).collect::<Vec<_>>(),
             },
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -512,6 +521,30 @@ fn status(config: &Config, paths: &Paths, json: bool) -> Result<u8> {
                 "missing"
             }
         );
+    }
+    if !config.sync.adapt_clients {
+        println!("client prompts   disabled");
+    } else {
+        println!(
+            "client prompts   {}",
+            if client_files.is_empty() {
+                "none detected".to_string()
+            } else {
+                format!("{} detected", client_files.len())
+            }
+        );
+        for adapter in &client_files {
+            println!(
+                "  {:<16} {}{}",
+                adapter.id,
+                adapter.path.display(),
+                if adapter.path.is_file() {
+                    ""
+                } else {
+                    "  (new)"
+                }
+            );
+        }
     }
     Ok(0)
 }

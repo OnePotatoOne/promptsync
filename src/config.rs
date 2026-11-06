@@ -147,6 +147,12 @@ pub struct SyncConfig {
     /// Delete files that were managed before but disappeared from the bundle.
     /// Off by default: shrinking the source set never removes user files.
     pub delete_removed: bool,
+    /// Copy the synced prompt into the global instruction file of every
+    /// detected coding agent (Codex, Claude, Kimi, DeepSeek, Cindy).
+    pub adapt_clients: bool,
+    /// Extra instruction files to update, on top of the auto-detected ones.
+    /// Absolute paths or `~/...`.
+    pub adapt_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +260,8 @@ impl Default for SyncConfig {
             keep_backups: 10,
             follow_symlinks: false,
             delete_removed: false,
+            adapt_clients: true,
+            adapt_paths: Vec::new(),
         }
     }
 }

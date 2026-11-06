@@ -6,6 +6,7 @@
 //!   fragment-level reliable layer on top.
 //! * The data port is only bound while a valid port-knock sequence opened a gate.
 
+pub mod adapters;
 pub mod agent;
 pub mod buildinfo;
 pub mod config;

@@ -175,9 +175,9 @@ pub fn prepare(
         if prompter.confirm("直接使用它启动？", true) {
             return Ok(Some(config));
         }
-        println!("进入配置向导，每一步直接回车即可保留当前值。");
+        println!("进入配置向导，回车保留当前值。");
     } else {
-        println!("首次启动：将用几步确认配置，每一步直接回车即可使用推荐值。");
+        println!("首次启动：回车使用推荐值。");
     }
 
     let total = match role {
@@ -210,7 +210,7 @@ fn server_wizard(
     first_run: bool,
 ) -> Result<()> {
     prompter.step(1, total, "监听地址与数据端口");
-    println!("数据端口只在端口敲门成功后才会绑定；填 0 表示由集群密钥自动推导。");
+    println!("数据端口在敲门成功后才会绑定；0 = 自动推导。");
     let bind = prompter.text("监听地址", &config.server.bind);
     let port = ask_port(prompter, "数据端口（0 = 自动推导）", config.server.port)?;
     apply(paths, Some("server"), "bind", &toml_string(bind.trim()))?;
@@ -348,13 +348,12 @@ fn configure_target(config: &mut Config, paths: &Paths, prompter: &Prompter) -> 
 fn configure_secret(config: &mut Config, paths: &Paths, prompter: &Prompter) -> Result<()> {
     let secret = ClusterSecret::resolve(&config.cluster_secret)?;
     let source = if config.cluster_secret.trim().is_empty() {
-        "编译进本二进制的那把随机密钥"
+        "内置"
     } else {
-        "配置文件里的密钥"
+        "配置"
     };
-    println!("当前使用：{source}（指纹 {}）。", secret.fingerprint());
-    println!("所有机器只要输入同一句话（任意短语或密码，不必是十六进制），");
-    println!("程序会自动推导出加密密钥。直接回车保持当前设置。");
+    println!("当前：{source}密钥，指纹 {}。", secret.fingerprint());
+    println!("输入所有机器共用的同一句口令（回车保持不变）：");
     loop {
         let value = prompter.text("集群口令", "");
         if value.trim().is_empty() {
@@ -369,15 +368,7 @@ fn configure_secret(config: &mut Config, paths: &Paths, prompter: &Prompter) -> 
                     &toml_string(&secret.to_hex()),
                 )?;
                 config.cluster_secret = secret.to_hex();
-                let kind = if value.trim().len() == 64
-                    && value.trim().chars().all(|c| c.is_ascii_hexdigit())
-                {
-                    "按 64 位 hex 使用"
-                } else {
-                    "已由口令推导"
-                };
-                println!("已更新（{kind}），指纹 {}。", secret.fingerprint());
-                println!("其它机器输入完全相同的一句话即可，大小写和空格都算数。");
+                println!("已更新，指纹 {}。", secret.fingerprint());
                 return Ok(());
             }
             Err(err) => eprintln!("口令无效：{err}"),
@@ -392,8 +383,7 @@ fn configure_feishu(
     logger: &Logger,
     default_enabled: bool,
 ) -> Result<()> {
-    println!("飞书用企业自建应用接收你私聊发来的纯文本，覆盖服务端那一个 prompt 文件；");
-    println!("同一个应用也用来发离线告警。");
+    println!("飞书自建应用：私聊发纯文本覆盖 prompt，同时发送离线告警。");
     if !prompter.confirm("启用飞书？", default_enabled) {
         apply(paths, Some("feishu"), "enabled", "false")?;
         config.feishu.enabled = false;
@@ -413,11 +403,15 @@ fn configure_feishu(
     }
 
     let options = [
-        "一键创建（推荐）：点开链接确认，自动填好 app_id / app_secret".to_string(),
+        "一键创建（推荐）：点开链接确认，自动填好凭据".to_string(),
         "已有应用：手动粘贴 app_id / app_secret".to_string(),
         "跳过飞书".to_string(),
     ];
-    let choice = prompter.select("创建飞书应用：", &options, 0);
+    let choice = prompter.select(
+        "创建飞书应用（已有应用可打开 https://open.feishu.cn/app 查看列表）：",
+        &options,
+        0,
+    );
     match choice {
         0 => {
             if let Err(err) = register_feishu_app(config, paths) {
@@ -528,8 +522,12 @@ fn manual_feishu_credentials(
     paths: &Paths,
     prompter: &Prompter,
 ) -> Result<()> {
-    println!("\n在飞书开放平台「凭证与基础信息」里复制 app_id / app_secret。");
-    println!("应用需要机器人能力，以及 im:message:readonly、im:message:send_as_bot、im:chat:readonly 权限。");
+    println!(
+        "\n打开 https://open.feishu.cn/app ，进入应用 → 凭证与基础信息，复制 app_id / app_secret。"
+    );
+    println!(
+        "应用需要机器人能力和 im:message:readonly、im:message:send_as_bot、im:chat:readonly 权限。"
+    );
     loop {
         let app_id = prompter.text("app_id", &config.feishu.app.app_id);
         let app_secret = prompter.text("app_secret", &config.feishu.app.app_secret);

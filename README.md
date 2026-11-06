@@ -10,9 +10,10 @@
 - 传输走 **UDP**：先做**随机端口敲门**，敲门成功前数据端口根本不绑定；握手用 **X25519 + 预共享密钥认证**，数据用 **AES-256-GCM**，带防重放窗口。
 - 连续 **2 分钟**失联自动通过**飞书自建应用**发离线告警（恢复后可选恢复通知）。
 - 绑定后可以直接给机器人**私聊发纯文本**，服务端自动覆盖唯一那个 prompt 文件，agent 再自动同步。
+- agent 拉取后**自动适配本机客户端**：Codex、Claude Code、Kimi、DeepSeek、Cindy 的全局指令文件一起更新，覆盖前自动备份。
 - **编译期随机生成所有密钥/口令**，仓库里不存在任何固定密钥；需要多台机器互通时可用 `cluster_secret` 显式对齐。
 - **个人配置集中在一个目录**（默认 `./config`，空目录启动时自动从模板生成，整个目录被 git 忽略）。
-- 单文件 Rust 二进制，本地编译；GitHub Actions 交叉编译 x86_64 安装包。
+- 单文件 Rust 二进制，本地编译；GitHub Actions 交叉编译各平台裸二进制。
 
 > 这是「可信内网/自建服务器 + 自己的多台电脑」场景的工具，不是面向公网多租户的服务。安全边界见 [安全模型](#安全模型与边界)。
 
@@ -34,7 +35,7 @@ cargo build --release
 
 飞书使用**自建应用**，`app_id`/`app_secret` 只保存在本机配置目录，**不会编进二进制**。
 
-> Release 里的压缩包**只有一个可执行文件**：`promptsync`（Windows 为 `promptsync.exe`）。配置模板已经编译进二进制，首次启动自动生成，不需要额外的 README、模板或安装脚本。
+> Release 里直接是**裸可执行文件**（没有 tar.gz / zip）：Linux/macOS 为 `promptsync-<平台>`，Windows 为 `promptsync-windows-x86_64.exe`。配置模板已经编译进二进制，首次启动自动生成，不需要额外的 README、模板或安装脚本。下载后 `chmod +x` 即可运行。
 
 同一次 `cargo build` 产出的 server 和 agent 天然共享密钥；**不同次编译**的二进制默认互不信任，这是刻意设计。
 
@@ -72,8 +73,8 @@ promptsync --config /etc/promptsync/config.toml status   # 直接指定文件（
 - **服务端首次启动（5 步）**
   1. 监听地址与数据端口（0 = 由密钥自动推导）；
   2. 要同步的 prompt 文件：自动列出候选（`system_prompt.md` / `SOUL.md`），多个时用序号选一个，并问"以后只同步这一个文件吗"；
-  3. 集群口令：显示当前指纹，直接回车用编译进二进制的密钥；也可以输入**任意一句话**（所有机器保持一致），程序自动推导密钥，不需要十六进制；
-  4. 飞书：确认启用 → 默认「一键创建」，点开链接确认后自动填好 `app_id` / `app_secret` 和 owner，并当场完成绑定；也支持手动粘贴已有应用凭据；
+  3. 集群口令：只显示当前指纹；输入所有机器共用的同一句话（任意短语）即可，回车保持不变；
+  4. 飞书：确认启用 → 默认「一键创建」，点开链接确认后自动填好 `app_id` / `app_secret` 和 owner，并当场完成绑定；已有应用可打开 `https://open.feishu.cn/app` 查看全部应用后手动粘贴；
   5. 摘要确认：显示监听、受管文件、密钥、飞书状态，回车开始运行。
 - **agent 首次启动（4 步）**
   1. 服务端地址与端口；2. 集群口令；3. 可选的 agent 端飞书告警凭据；4. 摘要确认。
@@ -165,6 +166,26 @@ globs = ["**/*.md", "**/*.txt"]
 - 默认跳过符号链接（`sync.follow_symlinks = true` 可打开）、隐藏目录、`.DS_Store`、`*.psync.tmp`；
 - 单文件上限 512 KiB，整包上限 `sync.max_bundle_bytes`（默认 1 MiB），文件数上限 1024；
 - 服务端是权威：agent 本地手工改过的 prompt 会在下一次拉取时被覆盖（覆盖前自动备份，见第 7 节）。
+
+### 2.1 自动适配本机客户端
+
+agent 把拉到的 prompt 再写进本机已安装客户端的全局指令文件，覆盖前自动备份：
+
+| 客户端 | 目标文件 | 覆盖目录的环境变量 |
+|---|---|---|
+| Kimi Code | `~/.kimi-code/AGENTS.md` | `KIMI_CODE_HOME` |
+| DeepSeek Harness | `~/.dsh/AGENTS.md` | `DSH_HOME` |
+| Codex CLI | `~/.codex/AGENTS.md` | `CODEX_HOME` |
+| Claude Code | `~/.claude/CLAUDE.md` | `CLAUDE_CONFIG_DIR` |
+| Cindy | `CindyGlobal/owners/*/bots/cindy-default/SOUL.md` | — |
+
+- 选哪个 prompt：优先服务端 `sync.target`；否则最大的 `SOUL.md` → 最大的 `system_prompt.md` → 唯一的文件 → 最大的 Markdown。
+- 只在客户端目录已存在（或目标文件已存在）时写入，不会凭空创建一堆目录。
+- 旧文件备份为同目录的 `<文件名>.<UTC 时间>.bak`，保留 `sync.keep_backups` 份（0 = 全部保留）。
+- 内容相同则跳过，不产生备份、不改 mtime。
+- 关闭：`adapt_clients = false`；额外客户端：`adapt_paths = ["~/path/to/AGENTS.md"]`。
+- 飞书私聊覆盖服务端 prompt 后，服务端本机的客户端也会立即适配。
+- `promptsync status` 会列出当前识别到的客户端文件。
 
 ---
 
@@ -364,6 +385,8 @@ max_bundle_bytes = 1048576
 keep_backups = 10
 follow_symlinks = false
 delete_removed = false     # 源集合变小时不删除 agent 上旧文件
+adapt_clients = true       # 自动适配本机 Codex/Claude/Kimi/DeepSeek/Cindy 的指令文件
+adapt_paths = []           # 额外目标文件（绝对路径或 ~/...）
 
 [[sync.sources]]
 id = "cindy-bots"
@@ -387,6 +410,7 @@ globs = ["*/bots/*/system_prompt.md"]
   - server：`agents.json`（每个 agent 的最后心跳/告警状态）
   - agent：`agent-state.json`（最后成功时间、服务端/本地 hash、失败次数、最近错误）
 - 备份：agent 每次覆盖前把旧文件放到 `config/state/backups/<UTC 时间戳>/<source id>/...`，默认保留 10 份。
+- 客户端适配备份：覆盖 `~/.codex/AGENTS.md` 等文件前，在同目录生成 `<文件名>.<UTC 时间>.bak`，保留 `sync.keep_backups` 份。
 - 查看：`promptsync status`（人类可读）或 `promptsync status --json`。
 
 ---
@@ -396,7 +420,7 @@ globs = ["*/bots/*/system_prompt.md"]
 ### Linux（systemd user）
 
 ```bash
-# 需要源码仓库里的 packaging/install.sh（release 压缩包只有二进制）
+# 需要源码仓库里的 packaging/install.sh（release 只有裸二进制）
 PROJECT_DIR=~/workspace/promptSync sh packaging/install.sh ./target/release/promptsync agent
 systemctl --user daemon-reload
 systemctl --user enable --now promptsync-agent
@@ -409,13 +433,13 @@ journalctl --user -u promptsync-agent -f
 ### macOS（launchd）
 
 ```bash
-# 需要源码仓库里的 packaging/install.sh（release 压缩包只有二进制）
+# 需要源码仓库里的 packaging/install.sh（release 只有裸二进制）
 PROJECT_DIR=~/workspace/promptSync sh packaging/install.sh ./target/release/promptsync agent
 launchctl load -w ~/Library/LaunchAgents/com.cindy.promptsync.agent.plist
 tail -f ~/workspace/promptSync/config/logs/agent.log
 ```
 
-也可以用源码仓库里的 `packaging/install.sh` 一键安装二进制 + 生成服务文件（不自动 sudo；release 压缩包只包含可执行文件，不含该脚本）。
+也可以用源码仓库里的 `packaging/install.sh` 一键安装二进制 + 生成服务文件（不自动 sudo；release 只包含可执行文件，不含该脚本）。
 
 ---
 
@@ -424,7 +448,7 @@ tail -f ~/workspace/promptSync/config/logs/agent.log
 | 工作流 | 触发 | 内容 |
 |---|---|---|
 | `.github/workflows/ci.yml` | push / PR | 秘密扫描、`cargo fmt --check`、`clippy -D warnings`、`cargo test` |
-| `.github/workflows/release.yml` | tag `v*` / 手动 | 交叉编译 x86_64 安装包并发布 |
+| `.github/workflows/release.yml` | tag `v*` / 手动 | 交叉编译各平台裸二进制并发布 |
 
 发一个新版本：
 
@@ -433,7 +457,7 @@ git tag -a v0.1.0 -m "promptsync v0.1.0"
 git push origin v0.1.0
 ```
 
-release 矩阵（全部 x86_64）：`x86_64-unknown-linux-gnu`、`x86_64-unknown-linux-musl`（静态，适合 Alpine/最小镜像）、`x86_64-apple-darwin`（Intel Mac）、`x86_64-pc-windows-msvc`。产物含二进制、README、`templates/`、服务模板与 `SHA256SUMS`。
+release 矩阵：`x86_64-unknown-linux-gnu`、`x86_64-unknown-linux-musl`（静态，适合 Alpine/最小镜像）、`aarch64-unknown-linux-gnu`、`aarch64-unknown-linux-musl`、`x86_64-apple-darwin`、`aarch64-apple-darwin`、`x86_64-pc-windows-msvc`。产物就是裸二进制（`promptsync-linux-x86_64`、`promptsync-macos-aarch64`、`promptsync-windows-x86_64.exe` 等）加一个 `SHA256SUMS`，没有压缩包。
 
 密钥策略：
 
@@ -496,6 +520,7 @@ cargo fmt --check
 | `src/knock.rs` | 随机敲门计划、state/gate、重放 burn、端口推导 |
 | `src/server.rs` | 权威源监听、会话、bundle 下发、agent 监控 |
 | `src/agent.rs` | 轮询、拉取、落盘、离线判定、飞书 |
+| `src/adapters.rs` | 把同步到的 prompt 适配到 Codex/Claude/Kimi/DeepSeek/Cindy 的指令文件 |
 | `src/prompts.rs` | glob 扫描、canonical hash、原子写入/备份/删除 |
 | `src/feishu.rs` | 飞书自建应用客户端（token、收发消息、绑定查询） |
 | `src/feishu_control.rs` | 绑定流程、私聊轮询、单文件覆盖 + .bak 备份 |

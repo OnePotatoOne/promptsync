@@ -75,6 +75,8 @@ fn cluster() -> Cluster {
     agent_config.feishu.enabled = false;
     agent_config.sync.sources = sources("cindy-bots", &agent_root);
     agent_config.sync.delete_removed = true;
+    // Tests must never touch the real ~/.codex, ~/.claude, ... files.
+    agent_config.sync.adapt_clients = false;
 
     let mut server_config = agent_config.clone();
     server_config.sync.sources = sources("cindy-bots", &server_root);

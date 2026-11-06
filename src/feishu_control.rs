@@ -550,23 +550,45 @@ fn poll_once(
                 bytes,
                 hash,
                 backup,
+                adapted,
+                adapt_errors,
             }) => {
                 cursor.record(&message.id, message.create_time_ms);
                 log_message = Some(format!(
-                    "Feishu update: {} ({} B, sha256 {}, backup {})",
+                    "Feishu update: {} ({} B, sha256 {}, backup {}{}{})",
                     target.key,
                     bytes,
                     &hash[..8.min(hash.len())],
                     backup
                         .as_ref()
                         .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| "none".to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    if adapted.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", clients {}", adapted.join(", "))
+                    },
+                    if adapt_errors.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", client errors: {}", adapt_errors.join("; "))
+                    }
                 ));
-                Some(format!(
+                let mut reply = format!(
                     "✅ 已更新 {}（{bytes} B，sha256 {}）",
                     target.key,
                     &hash[..8.min(hash.len())]
-                ))
+                );
+                if !adapted.is_empty() {
+                    reply.push_str(&format!("；已适配 {}", adapted.join(", ")));
+                }
+                if !adapt_errors.is_empty() {
+                    reply.push_str(&format!(
+                        "；{} 个客户端写入失败（详见日志）",
+                        adapt_errors.len()
+                    ));
+                }
+                Some(reply)
             }
             Ok(Applied::DryRun { bytes, hash }) => {
                 cursor.record(&message.id, message.create_time_ms);
@@ -603,6 +625,8 @@ enum Applied {
         bytes: usize,
         hash: String,
         backup: Option<PathBuf>,
+        adapted: Vec<String>,
+        adapt_errors: Vec<String>,
     },
     DryRun {
         bytes: usize,
@@ -678,10 +702,21 @@ fn apply_message(
     }
     atomic_write(&target.path, content.as_bytes(), true)
         .with_context(|| format!("writing {}", target.path.display()))?;
+    let adapted = crate::adapters::apply_content(&config.sync, content.as_bytes());
     Ok(Applied::Written {
         bytes,
         hash,
         backup,
+        adapted: adapted
+            .written
+            .into_iter()
+            .map(|(client, _, _)| client)
+            .collect(),
+        adapt_errors: adapted
+            .failed
+            .into_iter()
+            .map(|(client, path, err)| format!("{client} ({}): {err}", path.display()))
+            .collect(),
     })
 }
 
@@ -836,6 +871,7 @@ mod tests {
         config.feishu.app.owner_open_id = "ou_owner".to_string();
         config.feishu.timeout_secs = 5;
         config.sync.target = "cindy/acme/bots/cindy/system_prompt.md".to_string();
+        config.sync.adapt_clients = false;
         config.sync.sources = vec![crate::config::SourceConfig {
             id: "cindy".to_string(),
             root: root.display().to_string(),

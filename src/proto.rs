@@ -27,6 +27,10 @@ pub struct Manifest {
     pub files: usize,
     pub bytes: u64,
     pub updated_unix: u64,
+    /// The server's `sync.target`, so agents can prefer the same prompt when
+    /// adapting it to local client configs. Empty on older servers.
+    #[serde(default)]
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -270,6 +270,20 @@ async fn request(channel: &mut Channel, request: &Request, timeout: Duration) ->
     decode_response(&response)
 }
 
+fn log_adapted(report: &crate::adapters::AdaptReport, logger: &Logger) {
+    for (client, path, err) in &report.failed {
+        logger.warn(format!(
+            "client prompt for {client} ({}): {err}",
+            path.display()
+        ));
+    }
+    if report.has_changes() {
+        logger.info(format!("client prompts: {}", report.summary()));
+    } else if !report.is_empty() {
+        logger.debug(format!("client prompts: {}", report.summary()));
+    }
+}
+
 async fn send_bye(channel: &mut Channel, agent_id: &str) {
     let bye = Request::Bye {
         agent_id: agent_id.to_string(),
@@ -343,6 +357,10 @@ pub async fn sync_once(
             })
             .unwrap_or(false)
     {
+        // Keep client configs current even when the prompt itself did not
+        // change (e.g. a new client was installed after the last pull).
+        let adapted = crate::adapters::apply_bundle(&config.sync, &local_entries, &manifest.target);
+        log_adapted(&adapted, logger);
         send_bye(&mut channel, agent_id).await;
         return Ok(SyncOutcome::UpToDate {
             hash: manifest.hash,
@@ -427,6 +445,8 @@ pub async fn sync_once(
         config.sync.delete_removed,
         logger,
     )?;
+    let adapted = crate::adapters::apply_bundle(&config.sync, &applicable, &manifest.target);
+    log_adapted(&adapted, logger);
     let local_hash = canonical_hash(&applicable);
     logger.info(format!(
         "applied bundle {}: {}",
