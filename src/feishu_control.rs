@@ -2,6 +2,7 @@
 //! private-chat text messages into the one managed prompt file.
 
 use anyhow::{bail, Context, Result};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,7 @@ use crate::interactive::Prompter;
 use crate::logx::Logger;
 use crate::paths::Paths;
 use crate::prompts::SourceSpec;
-use crate::util::{atomic_write, now_unix, safe_relative_path};
+use crate::util::{atomic_write, now_unix, safe_relative_path, secure_join};
 
 pub const BINDING_FILE: &str = "feishu-binding.json";
 pub const CURSOR_FILE: &str = "feishu-cursor.json";
@@ -25,6 +26,10 @@ const SEEN_IDS_LIMIT: usize = 200;
 pub struct Binding {
     pub chat_id: String,
     pub open_id: String,
+    /// Bindings belong to one app and one explicitly authorised recipient.
+    /// Older files without this field are deliberately not reused.
+    #[serde(default)]
+    pub app_id: String,
     pub bound_unix: u64,
 }
 
@@ -100,9 +105,11 @@ pub fn resolve_target(config: &Config, sources: &[SourceSpec]) -> Result<TargetF
     {
         bail!("sync.target {target:?} is not covered by the source globs of {id:?}");
     }
+    let path = secure_join(&source.root, &relative, true)
+        .with_context(|| format!("resolving sync.target {target:?}"))?;
     Ok(TargetFile {
         key: target.to_string(),
-        path: source.root.join(relative),
+        path,
     })
 }
 
@@ -111,6 +118,16 @@ pub fn load_binding(data_dir: &Path) -> Option<Binding> {
     fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
+}
+
+pub fn binding_matches(config: &Config, binding: &Binding) -> bool {
+    let app_id = config.feishu.app.app_id.trim();
+    let owner = config.feishu.app.owner_open_id.trim();
+    !app_id.is_empty()
+        && binding.app_id == app_id
+        && !binding.chat_id.trim().is_empty()
+        && !binding.open_id.trim().is_empty()
+        && (owner.is_empty() || binding.open_id == owner)
 }
 
 fn save_binding(data_dir: &Path, binding: &Binding) -> Result<()> {
@@ -129,11 +146,34 @@ pub enum BindingPurpose {
     Agent,
 }
 
+const BINDING_CHALLENGE_TTL_SECS: u64 = 900;
+
+#[derive(Clone)]
+struct BindingChallenge {
+    code: String,
+    started_unix: u64,
+}
+
+impl BindingChallenge {
+    fn new() -> Self {
+        let mut random = [0u8; 12];
+        rand::rngs::OsRng.fill_bytes(&mut random);
+        Self {
+            code: format!("PSYNC-{}", hex::encode(random)),
+            started_unix: now_unix(),
+        }
+    }
+
+    fn expired(&self, now: u64) -> bool {
+        now.saturating_sub(self.started_unix) > BINDING_CHALLENGE_TTL_SECS
+    }
+}
+
 /// First-start binding.
 ///
 /// Order of attempts:
 /// 1. `owner_open_id` already configured: ping the owner, learn the chat id.
-/// 2. QR/link + "send the bot a message", then discover the p2p chat.
+/// 2. QR/link + a fresh one-time code, then discover the authorised p2p chat.
 /// 3. Fall back to a Feishu email/mobile (`feishu.control.bind_contact` or a prompt).
 pub fn ensure_binding(
     config: &mut Config,
@@ -170,7 +210,7 @@ pub fn ensure_binding(
     fs::create_dir_all(&data_dir)?;
     if !force {
         if let Some(binding) = load_binding(&data_dir) {
-            if !config.feishu.app.owner_open_id.trim().is_empty() {
+            if binding_matches(config, &binding) {
                 return Ok(Some(binding));
             }
         }
@@ -188,6 +228,7 @@ pub fn ensure_binding(
         let binding = Binding {
             chat_id: sent.chat_id,
             open_id: configured_owner,
+            app_id: config.feishu.app.app_id.trim().to_string(),
             bound_unix: now_unix(),
         };
         save_binding(&data_dir, &binding)?;
@@ -203,9 +244,11 @@ pub fn ensure_binding(
         config.feishu.app.app_id.trim()
     );
 
+    let challenge = BindingChallenge::new();
     if !prompter.enabled() {
         logger.warn(format!(
-            "Feishu app is not bound. Open {app_link} in Feishu, send the bot a message, then re-run `{rerun_command}` to finish binding."
+            "Feishu app is not bound. To authorise a specific account, send the one-time code {} from that account's private chat, then re-run `{rerun_command}`. You can also configure feishu.app.owner_open_id explicitly. {app_link}",
+            challenge.code
         ));
         return Ok(None);
     }
@@ -213,16 +256,20 @@ pub fn ensure_binding(
     println!("\n{heading}");
     println!("1) 用飞书扫描下面的二维码，或直接打开链接：\n   {app_link}\n");
     print_qr(&app_link);
-    println!("2) 在打开的机器人私聊里发送任意一句话（例如：绑定）");
     println!(
-        "3) 最多等待 {} 秒，检测到消息后会自动完成绑定\n",
+        "2) 用需要授权的账号，在机器人私聊里只发送下面这个一次性绑定码：\n\n   {}\n",
+        challenge.code
+    );
+    println!("   绑定码 15 分钟内有效；普通私聊消息不会再自动获得控制权。");
+    println!(
+        "3) 最多等待 {} 秒，检测到绑定码后会自动完成绑定\n",
         config.feishu.control.bind_timeout_secs.max(15)
     );
 
     let deadline =
         Instant::now() + Duration::from_secs(config.feishu.control.bind_timeout_secs.max(15));
     while Instant::now() < deadline {
-        match discover_p2p_binding(&client) {
+        match discover_p2p_binding(&client, &challenge) {
             Ok(Some(binding)) => {
                 save_binding(&data_dir, &binding)?;
                 set_value(
@@ -268,6 +315,7 @@ pub fn ensure_binding(
     let binding = Binding {
         chat_id: sent.chat_id,
         open_id: open_id.clone(),
+        app_id: config.feishu.app.app_id.trim().to_string(),
         bound_unix: now_unix(),
     };
     save_binding(&data_dir, &binding)?;
@@ -364,24 +412,41 @@ pub fn print_qr(link: &str) {
     }
 }
 
-/// Look for a private chat that already contains a message from a user.
-/// Feishu may not list p2p chats at all; in that case this returns `None` and
-/// the caller falls back to the contact lookup.
-fn discover_p2p_binding(client: &FeishuClient) -> Result<Option<Binding>> {
+/// Look for the one-time code in a private chat created after this flow began.
+/// A historical or ordinary private message must never grant prompt control.
+fn discover_p2p_binding(
+    client: &FeishuClient,
+    challenge: &BindingChallenge,
+) -> Result<Option<Binding>> {
     let now = now_unix();
+    if challenge.expired(now) {
+        return Ok(None);
+    }
     for chat in client.list_chats()? {
         if chat.mode != "p2p" {
             continue;
         }
-        let messages = client.list_messages(&chat.chat_id, now.saturating_sub(900), now + 60)?;
+        let messages = client.list_messages(
+            &chat.chat_id,
+            challenge.started_unix.saturating_sub(1),
+            now + 60,
+        )?;
         for message in messages.iter().rev() {
-            if message.sender_type == "user" && !message.sender_id.is_empty() {
-                return Ok(Some(Binding {
-                    chat_id: chat.chat_id.clone(),
-                    open_id: message.sender_id.clone(),
-                    bound_unix: now,
-                }));
+            if message.create_time_ms / 1000 < challenge.started_unix {
+                continue;
             }
+            if message.sender_type != "user" || message.sender_id.is_empty() {
+                continue;
+            }
+            if message_text(message).as_deref().map(str::trim) != Some(challenge.code.as_str()) {
+                continue;
+            }
+            return Ok(Some(Binding {
+                chat_id: chat.chat_id.clone(),
+                open_id: message.sender_id.clone(),
+                app_id: client.app_id().to_string(),
+                bound_unix: now,
+            }));
         }
     }
     Ok(None)
@@ -398,6 +463,15 @@ pub async fn run(
 ) -> Result<()> {
     let client = Arc::new(FeishuClient::from_config(&config)?);
     let poll_secs = config.feishu.control.poll_secs.max(2);
+    let binding = binding.and_then(|binding| {
+        if binding_matches(&config, &binding) {
+            Some(binding)
+        } else {
+            logger
+                .warn("Feishu binding does not match the current app/owner; rebinding is required");
+            None
+        }
+    });
     let binding = match binding {
         Some(binding) => binding,
         None => {
@@ -457,13 +531,26 @@ async fn bind_loop(
     poll_secs: u64,
     logger: &Logger,
 ) -> Result<Binding> {
-    logger.info("Feishu: 尚未绑定，正在等待你在飞书里给机器人发一条私聊消息（发一次即可自动绑定）");
+    let mut challenge = BindingChallenge::new();
+    logger.info(format!(
+        "Feishu: 尚未绑定。请用需要授权的账号在机器人私聊中只发送一次性绑定码 {}（15 分钟内有效）；发送普通消息不会获得控制权",
+        challenge.code
+    ));
     let mut last_error: Option<String> = None;
     loop {
+        if challenge.expired(now_unix()) {
+            challenge = BindingChallenge::new();
+            logger.info(format!("Feishu 绑定码已更新：{}", challenge.code));
+        }
         let config = config.clone();
         let client_for_task = Arc::clone(client);
-        let attempt =
-            tokio::task::spawn_blocking(move || try_bind_once(&config, &client_for_task)).await;
+        let attempt = {
+            let challenge = challenge.clone();
+            tokio::task::spawn_blocking(move || {
+                try_bind_once(&config, &client_for_task, &challenge)
+            })
+            .await
+        };
         match attempt {
             Ok(Ok(Some(binding))) => {
                 save_binding(data_dir, &binding)?;
@@ -503,7 +590,11 @@ async fn bind_loop(
 
 /// One binding attempt: a configured owner is pinged directly; otherwise we
 /// look for an existing p2p chat that already contains a user message.
-fn try_bind_once(config: &Config, client: &FeishuClient) -> Result<Option<Binding>> {
+fn try_bind_once(
+    config: &Config,
+    client: &FeishuClient,
+    challenge: &BindingChallenge,
+) -> Result<Option<Binding>> {
     let owner = config.feishu.app.owner_open_id.trim();
     if !owner.is_empty() {
         let sent = client.send_text_to_owner(
@@ -513,10 +604,11 @@ fn try_bind_once(config: &Config, client: &FeishuClient) -> Result<Option<Bindin
         return Ok(Some(Binding {
             chat_id: sent.chat_id,
             open_id: owner.to_string(),
+            app_id: config.feishu.app.app_id.trim().to_string(),
             bound_unix: now_unix(),
         }));
     }
-    discover_p2p_binding(client)
+    discover_p2p_binding(client, challenge)
 }
 
 struct PollOutcome {
@@ -695,7 +787,7 @@ fn apply_message(
 
     let mut backup = None;
     if let Ok(existing) = fs::read(&target.path) {
-        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ").to_string();
         let name = target
             .path
             .file_name()
@@ -897,6 +989,7 @@ mod tests {
         let binding = Binding {
             chat_id: "oc_p2p".to_string(),
             open_id: "ou_owner".to_string(),
+            app_id: "cli_test".to_string(),
             // 0 lets the fixture messages (created "now") count as new.
             bound_unix: 0,
         };
@@ -923,15 +1016,60 @@ mod tests {
         mock.chats.lock().unwrap().push(json!({
             "chat_id": "oc_p2p", "chat_mode": "p2p", "name": ""
         }));
-        mock.push_text("绑定", "ou_owner");
+        let challenge = BindingChallenge::new();
+        mock.push_text("ordinary messages must not bind", "ou_someone");
+        mock.push_text(&challenge.code, "ou_owner");
         let mut config = Config::default();
         config.feishu.app.app_id = "cli_test".to_string();
         config.feishu.app.app_secret = "secret".to_string();
         config.feishu.app.api_base = mock.base.clone();
         let client = FeishuClient::new(&config.feishu.app, Duration::from_secs(5)).unwrap();
-        let binding = discover_p2p_binding(&client).unwrap().expect("binding");
+        let binding = discover_p2p_binding(&client, &challenge)
+            .unwrap()
+            .expect("binding");
         assert_eq!(binding.chat_id, "oc_p2p");
         assert_eq!(binding.open_id, "ou_owner");
+        assert_eq!(binding.app_id, "cli_test");
+
+        mock.messages.lock().unwrap().clear();
+        mock.push_text("PSYNC-wrong-code", "ou_someone");
+        assert!(discover_p2p_binding(&client, &challenge).unwrap().is_none());
+
+        mock.messages.lock().unwrap().clear();
+        mock.messages.lock().unwrap().push(json!({
+            "message_id": "old-code",
+            "create_time": ((challenge.started_unix - 10) * 1000).to_string(),
+            "msg_type": "text",
+            "body": { "content": json!({ "text": challenge.code }).to_string() },
+            "sender": { "id": "ou_someone", "sender_type": "user" },
+            "chat_id": "oc_p2p",
+        }));
+        assert!(discover_p2p_binding(&client, &challenge).unwrap().is_none());
+    }
+
+    #[test]
+    fn binding_must_match_the_current_app_and_owner() {
+        let mut config = Config::default();
+        config.feishu.app.app_id = "cli_new".to_string();
+        config.feishu.app.owner_open_id = "ou_new".to_string();
+        let binding = Binding {
+            chat_id: "oc_chat".to_string(),
+            open_id: "ou_old".to_string(),
+            app_id: "cli_old".to_string(),
+            bound_unix: 1,
+        };
+        assert!(!binding_matches(&config, &binding));
+        let binding = Binding {
+            open_id: "ou_new".to_string(),
+            app_id: "cli_new".to_string(),
+            ..binding
+        };
+        assert!(binding_matches(&config, &binding));
+        let legacy = Binding {
+            app_id: String::new(),
+            ..binding
+        };
+        assert!(!binding_matches(&config, &legacy));
     }
 
     #[test]
@@ -1057,7 +1195,12 @@ mod tests {
         let sources = crate::prompts::resolve_sources(&config.sync);
         let target = resolve_target(&config, &sources).unwrap();
         assert_eq!(target.key, "cindy/acme/bots/cindy/system_prompt.md");
-        assert_eq!(target.path, root.join("acme/bots/cindy/system_prompt.md"));
+        assert_eq!(
+            target.path,
+            fs::canonicalize(&root)
+                .unwrap()
+                .join("acme/bots/cindy/system_prompt.md")
+        );
 
         config.sync.target = "cindy/../../etc/passwd".to_string();
         assert!(resolve_target(&config, &sources).is_err());

@@ -131,17 +131,21 @@ impl ClusterSecret {
         Self(out)
     }
 
-    pub fn embedded() -> Result<Self> {
-        Self::from_hex(crate::buildinfo::embedded_cluster_secret())
-    }
-
-    /// Resolve a configured secret, falling back to the compiled-in value.
+    /// Resolve a configured secret.
+    ///
+    /// There is deliberately no fallback to a value compiled into the binary:
+    /// first start generates a random secret and writes it to `config.toml`.
+    /// An empty value here means the caller forgot to run
+    /// `Config::ensure_cluster_secret` and must fail instead of silently
+    /// joining a public key that every release user shares.
     pub fn resolve(configured: &str) -> Result<Self> {
         if configured.trim().is_empty() {
-            Self::embedded()
-        } else {
-            Self::from_hex(configured)
+            bail!(
+                "cluster_secret is empty; start the server or agent once \
+                 (it will generate one) or run `promptsync secret --set <passphrase>`"
+            );
         }
+        Self::from_hex(configured)
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -641,6 +645,13 @@ mod tests {
 
     fn secret() -> ClusterSecret {
         ClusterSecret::from_hex(&"11".repeat(32)).unwrap()
+    }
+
+    #[test]
+    fn empty_secret_is_not_replaced_by_a_build_default() {
+        assert!(ClusterSecret::resolve("").is_err());
+        assert!(ClusterSecret::resolve("   ").is_err());
+        assert!(ClusterSecret::resolve(&"11".repeat(32)).is_ok());
     }
 
     #[test]

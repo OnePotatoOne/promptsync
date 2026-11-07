@@ -131,6 +131,20 @@ async fn dispatch(cli: Cli) -> Result<u8> {
     }
     let (mut config, created) = paths.load()?;
 
+    // First start (or an old config created before this feature) gets a random
+    // cluster secret. Never fall back to a key compiled into the binary: that
+    // would make every download of the public release share the same key.
+    let secret_generated = match &cli.command {
+        Command::Server { .. } | Command::Agent { .. } => {
+            ensure_cluster_secret(&paths, &mut config, false)?
+        }
+        Command::Status { json } => ensure_cluster_secret(&paths, &mut config, *json)?,
+        Command::Ports => ensure_cluster_secret(&paths, &mut config, false)?,
+        // `Secret` handles generation itself so `--set` does not first create a
+        // throwaway key, and `FeishuTest`/`ConfigFile` do not need one.
+        _ => false,
+    };
+
     // Interactive only for the long-running roles, and only when the caller did
     // not already pass explicit overrides (that means "scripted use").
     let explicit_override = match &cli.command {
@@ -150,7 +164,15 @@ async fn dispatch(cli: Cli) -> Result<u8> {
             }
             let logger = make_logger(&config, &paths, "server", cli.log_level.as_deref())?;
             log_paths(&logger, &paths, created);
-            match interactive::prepare(&paths, config, created, Role::Server, &prompter, &logger)? {
+            match interactive::prepare(
+                &paths,
+                config,
+                created,
+                Role::Server,
+                &prompter,
+                &logger,
+                secret_generated,
+            )? {
                 Some(prepared) => config = prepared,
                 None => {
                     println!("已取消启动，配置保留在 {}", paths.config_file.display());
@@ -184,7 +206,15 @@ async fn dispatch(cli: Cli) -> Result<u8> {
             }
             let logger = make_logger(&config, &paths, "agent", cli.log_level.as_deref())?;
             log_paths(&logger, &paths, created);
-            match interactive::prepare(&paths, config, created, Role::Agent, &prompter, &logger)? {
+            match interactive::prepare(
+                &paths,
+                config,
+                created,
+                Role::Agent,
+                &prompter,
+                &logger,
+                secret_generated,
+            )? {
                 Some(prepared) => config = prepared,
                 None => {
                     println!("已取消启动，配置保留在 {}", paths.config_file.display());
@@ -260,9 +290,44 @@ fn log_paths(logger: &Logger, paths: &Paths, created: bool) {
     logger.info(format!("state:  {}", paths.data_dir().display()));
 }
 
+/// Generate the cluster secret when the config does not have one yet and show
+/// it once. The secret is deliberately printed to stdout (not the log file):
+/// it is needed to pair the other machines, and the user may not have opened
+/// `config.toml` yet.
+fn ensure_cluster_secret(paths: &Paths, config: &mut Config, to_stderr: bool) -> Result<bool> {
+    match config.ensure_cluster_secret(&paths.config_file)? {
+        Some(secret) => {
+            if to_stderr {
+                eprint!("{}", generated_secret_text(paths, &secret));
+            } else {
+                print!("{}", generated_secret_text(paths, &secret));
+            }
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+fn generated_secret_text(paths: &Paths, secret: &ClusterSecret) -> String {
+    format!(
+        "\n已为本机生成新的集群密钥（首次启动只生成一次）：\n  {}\n  指纹: {}\n  已写入: {}\n  所有机器必须使用同一个密钥。其他机器首次启动时粘贴它，\n  或运行 `promptsync secret --set \"<上面这串>\"`。\n  以后查看: `promptsync secret --show`，或打开上面的配置文件。\n  注意：这串密钥只在本终端显示，不要发到公开群或提交到 git。\n\n",
+        secret.to_hex(),
+        secret.fingerprint(),
+        paths.config_file.display()
+    )
+}
+
+fn print_generated_secret(paths: &Paths, secret: &ClusterSecret) {
+    print!("{}", generated_secret_text(paths, secret));
+}
+
 fn init(paths: &Paths, force: bool) -> Result<u8> {
     let backup = paths.write_template(force)?;
-    let (config, _) = paths.load()?;
+    let (mut config, _) = paths.load()?;
+    let generated = config.ensure_cluster_secret(&paths.config_file)?;
+    if let Some(secret) = generated.as_ref() {
+        print_generated_secret(paths, secret);
+    }
     let secret = ClusterSecret::resolve(&config.cluster_secret)?;
     let ports = server_ports(&config.server, &secret);
     std::fs::create_dir_all(paths.data_dir())?;
@@ -279,16 +344,23 @@ fn init(paths: &Paths, force: bool) -> Result<u8> {
         "derived ports:     data {}, knock pool {:?} (random subset/order per attempt)",
         ports.main, ports.knock_pool
     );
+    if generated.is_none() {
+        println!("cluster secret:    {}", secret.to_hex());
+    }
     println!(
         "secret fingerprint: {} (same secret is required on every machine)",
         secret.fingerprint()
+    );
+    println!(
+        "secret file:       {} -> cluster_secret",
+        paths.config_file.display()
     );
     println!("\nnote: this config directory is ignored by git and must never be committed.");
     println!("next steps:");
     println!("  1. on the server:  promptsync server");
     println!("  2. on each agent:  set agent.server in the config, then promptsync agent");
     println!(
-        "  3. if you build separately per machine, run `promptsync secret --show` on the server\n     or pick one passphrase and enter it on every machine (wizard step 3 / `secret --set <passphrase>`)."
+        "  3. copy the cluster secret above to every other machine (wizard step 3 / `promptsync secret --set <secret>`)."
     );
     Ok(0)
 }
@@ -308,13 +380,9 @@ fn ports(config: &Config, paths: &Paths) -> Result<u8> {
     );
     println!("config dir: {}", paths.config_dir.display());
     println!(
-        "secret:     fingerprint {} ({})",
+        "secret:     fingerprint {} (stored in {})",
         secret.fingerprint(),
-        if config.cluster_secret.trim().is_empty() {
-            "embedded build secret"
-        } else {
-            "configured"
-        }
+        paths.config_file.display()
     );
     println!(
         "data port:  {} (server bind {}:{})",
@@ -360,16 +428,18 @@ fn secret(
         println!("# type the same passphrase on every other machine");
         return Ok(0);
     }
+
+    // `--show` or no arguments: make sure a first-run config gets a key, and
+    // print it once (the same wording as server/agent startup).
+    if let Some(generated) = config.ensure_cluster_secret(&paths.config_file)? {
+        print_generated_secret(paths, &generated);
+    }
     let secret = resolve_secret(config)?;
     if show || set.is_none() {
         println!("{}", secret.to_hex());
         println!(
-            "# keep this private; source: {}",
-            if config.cluster_secret.trim().is_empty() {
-                "compiled into this build"
-            } else {
-                "config file"
-            }
+            "# keep this private; stored in {} (cluster_secret)",
+            paths.config_file.display()
         );
     }
     Ok(0)
@@ -407,7 +477,7 @@ fn status(config: &Config, paths: &Paths, json: bool) -> Result<u8> {
             "state_dir": data_dir.display().to_string(),
             "log_dir": log_dir.display().to_string(),
             "secret_fingerprint": secret.fingerprint(),
-            "secret_source": if config.cluster_secret.trim().is_empty() { "embedded" } else { "config" },
+            "secret_source": "config",
             "ports": { "data": ports.main, "knock_pool": ports.knock_pool, "agent_data": agent_endpoints.main, "agent_knock_pool": agent_endpoints.knock_pool },
             "agent": {
                 "id": agent::effective_agent_id(config),
@@ -450,13 +520,8 @@ fn status(config: &Config, paths: &Paths, json: bool) -> Result<u8> {
     println!("state dir        {}", data_dir.display());
     println!("logs             {}", log_dir.display());
     println!(
-        "secret           fingerprint {} ({})",
-        secret.fingerprint(),
-        if config.cluster_secret.trim().is_empty() {
-            "embedded"
-        } else {
-            "config"
-        }
+        "secret           fingerprint {} (config)",
+        secret.fingerprint()
     );
     println!(
         "server data port {} (bind {})",

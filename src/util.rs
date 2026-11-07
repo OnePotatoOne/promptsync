@@ -26,12 +26,18 @@ pub fn replace_file(temp: &Path, target: &Path) -> io::Result<()> {
     match fs::rename(temp, target) {
         Ok(()) => Ok(()),
         Err(err) => {
+            // Unix rename already replaces files atomically. Deleting the old
+            // file after an unrelated rename error would only create a window
+            // with no valid prompt. Windows needs this compatibility fallback.
+            #[cfg(windows)]
             if target.exists() {
                 fs::remove_file(target)?;
-                fs::rename(temp, target)
-            } else {
-                Err(err)
+                return fs::rename(temp, target);
             }
+            #[cfg(not(windows))]
+            return Err(err);
+            #[cfg(windows)]
+            Err(err)
         }
     }
 }
@@ -138,6 +144,43 @@ pub fn safe_relative_path(raw: &str) -> Option<PathBuf> {
     }
 }
 
+/// Join a validated relative path without following symlinks below the source
+/// root. The configured root itself is canonicalised, so an explicitly chosen
+/// `~/prompts` symlink remains usable, but links inside the tree cannot redirect
+/// writes or deletes to another location.
+pub fn secure_join(root: &Path, relative: &Path, create_root: bool) -> io::Result<PathBuf> {
+    if create_root {
+        fs::create_dir_all(root)?;
+    }
+    let canonical_root = match fs::canonicalize(root) {
+        Ok(root) => root,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(root.join(relative)),
+        Err(err) => return Err(err),
+    };
+    let mut target = canonical_root;
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "target is not a normal relative path",
+            ));
+        };
+        target.push(part);
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("refusing to follow symlink {}", target.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(target)
+}
+
 /// Quote a string as a TOML basic string (for `set_value`).
 pub fn toml_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
@@ -215,6 +258,22 @@ mod tests {
         assert!(safe_relative_path("C:/x").is_none());
         assert!(safe_relative_path("").is_none());
         assert!(safe_relative_path(".hidden.psync.tmp").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_join_rejects_symlinked_targets_and_parents() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("linked")).unwrap();
+        assert!(secure_join(&root, Path::new("linked/new.md"), true).is_err());
+        assert!(secure_join(&root, Path::new("linked"), false).is_err());
+        let plain = secure_join(&root, Path::new("nested/new.md"), true).unwrap();
+        assert!(plain.starts_with(fs::canonicalize(&root).unwrap()));
     }
 
     #[test]

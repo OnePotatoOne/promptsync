@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::crypto::ClusterSecret;
+
 pub const DEFAULT_POLL_SECS: u64 = 10;
 pub const DEFAULT_OFFLINE_THRESHOLD_SECS: u64 = 120;
 pub const DEFAULT_GATE_TTL_SECS: u64 = 90;
@@ -17,9 +19,10 @@ pub const DEFAULT_MAX_BUNDLE_BYTES: u64 = 1024 * 1024;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Hex encoded 32-byte cluster secret. Empty means "use the value compiled
-    /// into this build". All machines must agree, otherwise knocks and
-    /// handshakes are rejected.
+    /// Hex encoded 32-byte cluster secret. Empty means "not generated yet";
+    /// first start fills it with a random value and writes it back to the
+    /// config file. All machines must agree, otherwise knocks and handshakes
+    /// are rejected.
     pub cluster_secret: String,
     pub server: ServerConfig,
     pub agent: AgentConfig,
@@ -332,14 +335,37 @@ pub fn default_sources() -> Vec<SourceConfig> {
 }
 
 impl Config {
+    /// Generate and persist a random cluster secret when none is configured.
+    ///
+    /// The returned value is the newly generated secret, or `None` when the
+    /// config already had one. The caller is responsible for showing it to the
+    /// user exactly once: it is the only value the other machines need in order
+    /// to join this cluster. The secret is written through `set_cluster_secret`
+    /// so template comments and every other config line stay intact.
+    pub fn ensure_cluster_secret(&mut self, path: &Path) -> Result<Option<ClusterSecret>> {
+        if !self.cluster_secret.trim().is_empty() {
+            return Ok(None);
+        }
+        let secret = ClusterSecret::random();
+        let hex = secret.to_hex();
+        set_cluster_secret(path, &hex).with_context(|| {
+            format!(
+                "writing the generated cluster secret to {} (the file must be writable)",
+                path.display()
+            )
+        })?;
+        self.cluster_secret = hex;
+        Ok(Some(secret))
+    }
+
     pub fn save(&self, path: &Path) -> Result<()> {
         let body = toml::to_string_pretty(self).context("serialising config")?;
         let header = "\
 # promptsync configuration
 # Generated on first run. Keep this file private (mode 0600) - it may hold the
-# cluster secret. \"cluster_secret\" empty means: use the secret compiled into
-# this build. Set the same hex value on server and agents to pair binaries that
-# were built separately.
+# cluster secret. \"cluster_secret\" is generated automatically on first start;
+# copy the same value to every machine (or enter one shared passphrase in the
+# wizard). An empty value means the secret has not been generated yet.
 
 ";
         crate::util::atomic_write(path, format!("{header}{body}").as_bytes(), true)
@@ -633,6 +659,36 @@ mod tests {
         assert!(text.contains("# header"));
         assert!(text.contains("[agent]"));
         assert!(text.contains(&format!("cluster_secret = \"{hex}\"")));
+    }
+
+    #[test]
+    fn ensure_cluster_secret_generates_once_and_writes_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# header\ncluster_secret = \"\"\n\n[agent]\npoll_secs = 10\n",
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        let generated = config
+            .ensure_cluster_secret(&path)
+            .unwrap()
+            .expect("a new secret");
+        assert_eq!(config.cluster_secret, generated.to_hex());
+        assert_eq!(config.cluster_secret.len(), 64);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# header"));
+        assert!(text.contains("[agent]"));
+        assert!(text.contains(&format!("cluster_secret = \"{}\"", generated.to_hex())));
+
+        // A second start must keep the existing value and must not generate a
+        // new key merely because the process restarted.
+        let before = text;
+        assert!(config.ensure_cluster_secret(&path).unwrap().is_none());
+        assert_eq!(config.cluster_secret, generated.to_hex());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
     #[test]

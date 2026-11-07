@@ -158,6 +158,7 @@ pub fn prepare(
     role: Role,
     prompter: &Prompter,
     logger: &Logger,
+    secret_generated: bool,
 ) -> Result<Option<Config>> {
     if !prompter.enabled() {
         if created {
@@ -191,7 +192,7 @@ pub fn prepare(
         }
         let (reloaded, _) = paths.load()?;
         config = reloaded;
-        print_summary(&config, paths, role);
+        print_summary(&config, paths, role, secret_generated);
         if prompter.confirm("保存并启动？", true) {
             return Ok(Some(config));
         }
@@ -356,13 +357,12 @@ fn configure_target(config: &mut Config, paths: &Paths, prompter: &Prompter) -> 
 
 fn configure_secret(config: &mut Config, paths: &Paths, prompter: &Prompter) -> Result<()> {
     let secret = ClusterSecret::resolve(&config.cluster_secret)?;
-    let source = if config.cluster_secret.trim().is_empty() {
-        "内置"
-    } else {
-        "配置"
-    };
-    println!("当前：{source}密钥，指纹 {}。", secret.fingerprint());
-    println!("输入所有机器共用的同一句口令（回车保持不变）：");
+    println!(
+        "当前集群密钥指纹 {}（已保存在 {}）。",
+        secret.fingerprint(),
+        paths.config_file.display()
+    );
+    println!("输入所有机器共用的同一句口令；直接回车保留当前随机密钥：");
     loop {
         let value = prompter.text("集群口令", "");
         if value.trim().is_empty() {
@@ -377,7 +377,11 @@ fn configure_secret(config: &mut Config, paths: &Paths, prompter: &Prompter) -> 
                     &toml_string(&secret.to_hex()),
                 )?;
                 config.cluster_secret = secret.to_hex();
-                println!("已更新，指纹 {}。", secret.fingerprint());
+                println!(
+                    "已更新，指纹 {}；之前打印的初始随机密钥已作废，请以这个值为准。",
+                    secret.fingerprint()
+                );
+                println!("这个值已写入 {}。", paths.config_file.display());
                 return Ok(());
             }
             Err(err) => eprintln!("口令无效：{err}"),
@@ -632,7 +636,7 @@ fn finish_feishu(
         },
         Ok(None) => match role {
             Role::Server => {
-                println!("飞书还没完成绑定；服务启动后会自动等待你发来第一条私聊消息。")
+                println!("飞书还没完成绑定；服务启动后会在日志中给出一次性绑定码，请从授权账号的私聊发送。")
             }
             Role::Agent => {
                 println!("飞书还没完成绑定；离线告警暂不会发送。");
@@ -649,55 +653,167 @@ fn finish_feishu(
     Ok(())
 }
 
-fn print_summary(config: &Config, paths: &Paths, role: Role) {
-    let ports = match ClusterSecret::resolve(&config.cluster_secret) {
-        Ok(secret) => crate::knock::server_ports(&config.server, &secret),
-        Err(_) => crate::knock::Ports {
-            main: config.server.port,
-            knock_pool: Vec::new(),
-        },
-    };
+fn print_summary(config: &Config, paths: &Paths, role: Role, show_secret: bool) {
+    let secret = ClusterSecret::resolve(&config.cluster_secret).ok();
+    let server_endpoints = secret
+        .as_ref()
+        .map(|secret| crate::knock::server_ports(&config.server, secret));
+    let agent_endpoints = secret
+        .as_ref()
+        .map(|secret| crate::knock::agent_ports(&config.agent, secret));
+    let adapters = crate::adapters::detect(&config.sync);
+
     println!("\n──── 配置摘要 ────");
-    println!("配置文件   {}", paths.config_file.display());
+    println!("版本         {}", crate::buildinfo::description());
+    println!("角色         {}", role.label());
+    println!("配置文件     {}", paths.config_file.display());
+    println!("配置目录     {}", paths.config_dir.display());
+    println!("状态目录     {}", paths.data_dir().display());
+    println!("日志目录     {}", paths.log_dir(config).display());
+
+    if let Some(secret) = &secret {
+        if show_secret {
+            println!("集群密钥     {}", secret.to_hex());
+            println!(
+                "密钥位置     {} -> cluster_secret",
+                paths.config_file.display()
+            );
+            println!("             这串密钥只在本终端显示，请保存好再继续；不要发到公开群。");
+        } else {
+            println!("集群密钥     已保存（指纹 {}）", secret.fingerprint());
+            println!(
+                "密钥位置     {} -> cluster_secret",
+                paths.config_file.display()
+            );
+            println!("             查看：promptsync secret --show");
+        }
+        println!("密钥指纹     {}", secret.fingerprint());
+    } else {
+        println!("集群密钥     无法解析，请重新运行并检查 cluster_secret");
+    }
+
     if role == Role::Server {
+        if let Some(ports) = &server_endpoints {
+            println!(
+                "监听         {}:{}",
+                config.server.bind,
+                if config.server.port == 0 {
+                    format!("{}（自动）", ports.main)
+                } else {
+                    config.server.port.to_string()
+                }
+            );
+            println!("数据端口     {}", ports.main);
+            println!(
+                "敲门端口     {} 个：{:?}",
+                ports.knock_pool.len(),
+                ports.knock_pool
+            );
+        }
         println!(
-            "监听       {}:{}",
-            config.server.bind,
-            if config.server.port == 0 {
-                format!("{}（自动）", ports.main)
-            } else {
-                config.server.port.to_string()
-            }
-        );
-        println!("敲门端口   {}", ports.knock_pool.len());
-        println!(
-            "受管文件   {}",
+            "受管文件     {}",
             if config.sync.target.trim().is_empty() {
                 "（未设置）"
             } else {
                 config.sync.target.trim()
             }
         );
+        println!("同步源       {} 个", config.sync.sources.len());
     } else {
+        if let Some(ports) = &agent_endpoints {
+            println!(
+                "服务端       {}:{}",
+                config.agent.server,
+                if config.agent.port == 0 {
+                    format!("{}（自动）", ports.main)
+                } else {
+                    config.agent.port.to_string()
+                }
+            );
+            println!(
+                "轮询/离线    {}s / {}s",
+                config.agent.poll_secs, config.agent.offline_threshold_secs
+            );
+        }
+        println!("节点 ID      {}", crate::agent::effective_agent_id(config));
         println!(
-            "服务端     {}:{}",
-            config.agent.server,
-            if config.agent.port == 0 {
-                "自动".to_string()
+            "受管文件     {}",
+            if config.sync.target.trim().is_empty() {
+                "（由服务端下发）"
             } else {
-                config.agent.port.to_string()
+                config.sync.target.trim()
             }
         );
+        println!("同步源       {} 个", config.sync.sources.len());
     }
+
     println!(
-        "集群密钥   {}",
-        if config.cluster_secret.trim().is_empty() {
-            "使用编译进二进制的密钥"
+        "客户端适配   {}{}",
+        if config.sync.adapt_clients {
+            "启用"
         } else {
-            "配置文件中的密钥"
+            "关闭"
+        },
+        if adapters.is_empty() {
+            "（未检测到客户端）".to_string()
+        } else {
+            format!(
+                "，检测到 {} 个：{}",
+                adapters.len(),
+                adapters
+                    .iter()
+                    .map(|adapter| adapter.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         }
     );
-    println!("飞书       {}", crate::feishu::describe(config));
+
+    println!("飞书         {}", crate::feishu::describe(config));
+    if config.feishu.enabled {
+        let app_id = config.feishu.app.app_id.trim();
+        println!(
+            "飞书应用     {}",
+            if app_id.is_empty() {
+                "未配置".to_string()
+            } else {
+                mask_id(app_id)
+            }
+        );
+        let owner = config.feishu.app.owner_open_id.trim();
+        println!(
+            "告警接收人   {}",
+            if owner.is_empty() {
+                "未绑定".to_string()
+            } else {
+                mask_id(owner)
+            }
+        );
+        println!(
+            "飞书控制     target={} dry_run={}",
+            if config.sync.target.trim().is_empty() {
+                "-"
+            } else {
+                config.sync.target.trim()
+            },
+            config.feishu.control.dry_run
+        );
+    }
+
+    println!();
+    match role {
+        Role::Server => {
+            println!("下一步       其他机器首次启动时，在第 3 步粘贴上面的集群密钥；");
+            println!("             或运行 promptsync secret --set \"<这串密钥>\"。");
+        }
+        Role::Agent => {
+            println!("下一步       确认上面的密钥指纹与 server 一致；不一致就重新运行");
+            println!("             promptsync agent，在第 3 步粘贴 server 的集群密钥。");
+        }
+    }
+    if !show_secret {
+        println!("             查看完整密钥：promptsync secret --show");
+    }
     println!();
 }
 

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -49,6 +49,14 @@ struct AgentRegistry {
     agents: BTreeMap<String, AgentRecord>,
 }
 
+struct SessionEntry {
+    peer: SocketAddr,
+    sender: mpsc::Sender<Vec<u8>>,
+    instance: u64,
+    hello: Vec<u8>,
+    ready: Vec<u8>,
+}
+
 struct ServerState {
     config: Config,
     secret: Arc<ClusterSecret>,
@@ -60,8 +68,9 @@ struct ServerState {
     data_dir: std::path::PathBuf,
     logger: Logger,
     knocks: Arc<KnockTracker>,
-    sessions: Mutex<HashMap<[u8; 8], mpsc::Sender<Vec<u8>>>>,
+    sessions: Mutex<HashMap<[u8; 8], SessionEntry>>,
     session_count: AtomicUsize,
+    next_session_instance: AtomicU64,
     hello_attempts: Mutex<HashMap<IpAddr, Vec<Instant>>>,
     max_sessions: usize,
 }
@@ -119,6 +128,7 @@ pub async fn run(
         }),
         sessions: Mutex::new(HashMap::new()),
         session_count: AtomicUsize::new(0),
+        next_session_instance: AtomicU64::new(1),
         hello_attempts: Mutex::new(HashMap::new()),
         config,
         secret,
@@ -162,7 +172,7 @@ pub async fn run(
                         ));
                     } else {
                         logger.info(
-                            "Feishu: 尚未绑定；在飞书私聊里给机器人发一条消息即可自动完成绑定",
+                            "Feishu: 尚未绑定；请查看随后日志中的一次性绑定码，并从授权账号的私聊发送",
                         );
                     }
                     let config = state.config.clone();
@@ -351,6 +361,23 @@ async fn handle_datagram(
     state.gate.touch(peer.ip());
 
     if handshake_kind(packet) == Some(TYPE_HELLO) {
+        let session_id: [u8; 8] = packet[4..12].try_into().expect("validated HELLO header");
+        let existing = {
+            let sessions = match state.sessions.lock() {
+                Ok(sessions) => sessions,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            cached_hello(&sessions, &session_id, peer, packet)
+        };
+        if let Some((is_retransmit, ready)) = existing {
+            // Replaying an authenticated HELLO must be idempotent: creating a
+            // new ephemeral key here would desynchronise the first READY that
+            // the client accepted from the session retained by the server.
+            if is_retransmit {
+                let _ = socket.send_to(&ready, peer).await;
+            }
+            return;
+        }
         if !allow_hello(state, peer.ip()) {
             state
                 .logger
@@ -369,17 +396,33 @@ async fn handle_datagram(
         ) {
             Ok(handshake) => {
                 let (tx, rx) = mpsc::channel(2048);
+                let instance = state.next_session_instance.fetch_add(1, Ordering::Relaxed);
                 {
                     let mut sessions = match state.sessions.lock() {
                         Ok(sessions) => sessions,
                         Err(poisoned) => poisoned.into_inner(),
                     };
-                    sessions.insert(handshake.session, tx);
+                    // Another identical HELLO may have been handled between the
+                    // lookup and authentication. Never replace a live session.
+                    if sessions.contains_key(&handshake.session) {
+                        return;
+                    }
+                    sessions.insert(
+                        handshake.session,
+                        SessionEntry {
+                            peer,
+                            sender: tx,
+                            instance,
+                            hello: packet.to_vec(),
+                            ready: handshake.packet.clone(),
+                        },
+                    );
                 }
                 if socket.send_to(&handshake.packet, peer).await.is_err() {
                     state
                         .logger
                         .warn(format!("failed to answer HELLO from {peer}"));
+                    remove_session_if_current(state, &handshake.session, instance);
                     return;
                 }
                 state.logger.debug(format!(
@@ -391,6 +434,7 @@ async fn handle_datagram(
                     socket.clone(),
                     peer,
                     handshake.session,
+                    instance,
                     handshake.keys,
                     rx,
                 ));
@@ -413,7 +457,10 @@ async fn handle_datagram(
             Ok(sessions) => sessions,
             Err(poisoned) => poisoned.into_inner(),
         };
-        sessions.get(&header.session).cloned()
+        sessions
+            .get(&header.session)
+            .filter(|entry| entry.peer == peer)
+            .map(|entry| entry.sender.clone())
     };
     if let Some(sender) = sender {
         if sender.try_send(packet.to_vec()).is_err() {
@@ -445,6 +492,7 @@ async fn session_task(
     socket: Arc<UdpSocket>,
     peer: SocketAddr,
     session_id: [u8; 8],
+    instance: u64,
     keys: SessionKeys,
     rx: mpsc::Receiver<Vec<u8>>,
 ) {
@@ -544,18 +592,48 @@ async fn session_task(
         }
     }
 
-    {
-        let mut sessions = match state.sessions.lock() {
-            Ok(sessions) => sessions,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        sessions.remove(&session_id);
-    }
+    remove_session_if_current(&state, &session_id, instance);
     state.session_count.fetch_sub(1, Ordering::SeqCst);
     state.logger.debug(format!(
         "session {} closed for {peer} (agent {agent_id})",
         hex::encode(session_id)
     ));
+}
+
+fn cached_hello(
+    sessions: &HashMap<[u8; 8], SessionEntry>,
+    session_id: &[u8; 8],
+    peer: SocketAddr,
+    packet: &[u8],
+) -> Option<(bool, Vec<u8>)> {
+    sessions.get(session_id).map(|entry| {
+        (
+            entry.peer == peer && entry.hello == packet,
+            entry.ready.clone(),
+        )
+    })
+}
+
+fn remove_session_if_current(state: &ServerState, session_id: &[u8; 8], instance: u64) {
+    let mut sessions = match state.sessions.lock() {
+        Ok(sessions) => sessions,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    remove_session_from_map_if_current(&mut sessions, session_id, instance);
+}
+
+fn remove_session_from_map_if_current(
+    sessions: &mut HashMap<[u8; 8], SessionEntry>,
+    session_id: &[u8; 8],
+    instance: u64,
+) {
+    if sessions
+        .get(session_id)
+        .map(|entry| entry.instance == instance)
+        .unwrap_or(false)
+    {
+        sessions.remove(session_id);
+    }
 }
 
 async fn reply(channel: &mut Channel, config: &Config, response: &Response) -> Result<()> {
@@ -710,6 +788,49 @@ mod tests {
         assert_eq!(sanitize_agent_id("  mac\n1  "), "mac1");
         assert_eq!(sanitize_agent_id(""), "unknown");
         assert_eq!(sanitize_agent_id(&"x".repeat(200)).len(), 128);
+    }
+
+    fn session_entry(peer: SocketAddr, instance: u64) -> SessionEntry {
+        let (sender, _) = mpsc::channel(1);
+        SessionEntry {
+            peer,
+            sender,
+            instance,
+            hello: b"authenticated hello".to_vec(),
+            ready: b"original ready".to_vec(),
+        }
+    }
+
+    #[test]
+    fn repeated_hello_reuses_the_original_ready() {
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let other_peer: SocketAddr = "127.0.0.1:12346".parse().unwrap();
+        let session = [7u8; 8];
+        let sessions = HashMap::from([(session, session_entry(peer, 1))]);
+        let cached = cached_hello(&sessions, &session, peer, b"authenticated hello").unwrap();
+        assert!(cached.0);
+        assert_eq!(cached.1, b"original ready");
+        assert!(
+            !cached_hello(&sessions, &session, peer, b"different hello")
+                .unwrap()
+                .0
+        );
+        assert!(
+            !cached_hello(&sessions, &session, other_peer, b"authenticated hello")
+                .unwrap()
+                .0
+        );
+    }
+
+    #[test]
+    fn an_old_session_cannot_remove_a_newer_session() {
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let session = [9u8; 8];
+        let mut sessions = HashMap::from([(session, session_entry(peer, 2))]);
+        remove_session_from_map_if_current(&mut sessions, &session, 1);
+        assert!(sessions.contains_key(&session));
+        remove_session_from_map_if_current(&mut sessions, &session, 2);
+        assert!(!sessions.contains_key(&session));
     }
 
     #[test]

@@ -7,11 +7,13 @@ use std::time::Duration;
 
 use promptsync::agent::{sync_once, SyncOutcome};
 use promptsync::config::{Config, SourceConfig};
-use promptsync::crypto::ClusterSecret;
-use promptsync::knock::agent_ports;
+use promptsync::crypto::{ClientHello, ClusterSecret, KnockSequence, TYPE_READY};
+use promptsync::knock::{agent_ports, random_plan};
 use promptsync::logx::{Level, Logger};
 use promptsync::prompts::resolve_sources;
 use promptsync::server;
+use promptsync::util::now_unix;
+use promptsync::wire::handshake_kind;
 
 fn free_udp_port() -> u16 {
     let socket = StdUdpSocket::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -199,6 +201,53 @@ async fn end_to_end_sync_over_udp() {
         .agent_root
         .join("owner/bots/cindy/system_prompt.md")
         .exists());
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retransmitted_hello_returns_the_same_ready() {
+    let cluster = cluster();
+    let handle = start_server(&cluster).await;
+    let peer: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let socket = tokio::net::UdpSocket::bind(peer).await.unwrap();
+    let server = cluster.server_config.server.clone();
+    let ports = promptsync::knock::server_ports(&server, &cluster.secret);
+    let plan = random_plan(&ports.knock_pool, 3, Duration::ZERO, Duration::ZERO);
+    let sequence = KnockSequence::generate(plan.steps.len() as u8);
+    for step in &plan.steps {
+        let packet = sequence.packet(step.slot, &cluster.secret.knock_key(), now_unix());
+        socket
+            .send_to(&packet, ("127.0.0.1", step.port))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let hello = ClientHello::new(now_unix());
+    let packet = hello.packet(&cluster.secret.auth_key());
+    let server_addr = ("127.0.0.1", ports.main);
+    socket.send_to(&packet, server_addr).await.unwrap();
+    let mut first = vec![0u8; 256];
+    let (first_len, _) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut first))
+        .await
+        .expect("first READY")
+        .unwrap();
+    first.truncate(first_len);
+    assert_eq!(handshake_kind(&first), Some(TYPE_READY));
+
+    socket.send_to(&packet, server_addr).await.unwrap();
+    let mut second = vec![0u8; 256];
+    let (second_len, _) =
+        tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut second))
+            .await
+            .expect("retransmitted READY")
+            .unwrap();
+    second.truncate(second_len);
+    assert_eq!(
+        second, first,
+        "retransmission must reuse the same server key"
+    );
 
     handle.abort();
 }

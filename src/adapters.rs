@@ -361,7 +361,7 @@ fn write_one(path: &Path, content: &[u8], keep_backups: usize) -> Result<WriteOu
 }
 
 fn backup_existing(path: &Path, content: &[u8], keep_backups: usize) -> Result<PathBuf> {
-    let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+    let stamp = Utc::now().format("%Y%m%dT%H%M%S%.9fZ");
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().to_string())

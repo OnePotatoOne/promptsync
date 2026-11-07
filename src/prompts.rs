@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use crate::config::SyncConfig;
 use crate::globpat;
 use crate::logx::Logger;
-use crate::util::{atomic_write, expand_tilde, safe_relative_path};
+use crate::util::{atomic_write, expand_tilde, safe_relative_path, secure_join};
 
 pub const MAX_FILE_BYTES: u64 = 512 * 1024;
 pub const MAX_FILES: usize = 1024;
@@ -247,15 +247,31 @@ fn load_managed(data_dir: &Path) -> ManagedState {
     serde_json::from_str(&text).unwrap_or_default()
 }
 
-/// Resolve `<source id>/<relative>` to an absolute path inside a known root.
+/// Resolve `<source id>/<relative>` to a path that cannot follow symlinks below
+/// the configured root. `create_root` is only enabled for writes, not deletes.
 fn resolve_entry<'a>(
     roots: &'a BTreeMap<String, PathBuf>,
     key: &str,
-) -> Option<(&'a PathBuf, PathBuf)> {
-    let (id, rest) = key.split_once('/')?;
-    let root = roots.get(id)?;
-    let relative = safe_relative_path(rest)?;
-    Some((root, relative))
+    create_root: bool,
+) -> Result<(&'a PathBuf, PathBuf)> {
+    let (id, rest) = key
+        .split_once('/')
+        .with_context(|| format!("bundle entry {key:?} has no source id"))?;
+    let root = roots
+        .get(id)
+        .with_context(|| format!("bundle entry {key:?} does not map to a local source"))?;
+    let relative = safe_relative_path(rest)
+        .with_context(|| format!("bundle entry {key:?} has an unsafe path"))?;
+    let target = secure_join(root, &relative, create_root)
+        .with_context(|| format!("resolving target for {key}"))?;
+    Ok((root, target))
+}
+
+struct StagedWrite {
+    temp: PathBuf,
+    target: PathBuf,
+    backup: Option<PathBuf>,
+    previous_mode: Option<u32>,
 }
 
 /// Write a pulled bundle to disk. Server data is authoritative: files recorded
@@ -276,76 +292,112 @@ pub fn apply(
     // Validate the whole bundle before touching the filesystem.
     let mut plan: Vec<(String, PathBuf, &[u8])> = Vec::new();
     for (key, content) in entries {
-        let (root, relative) = resolve_entry(&roots, key).ok_or_else(|| {
-            anyhow::anyhow!("bundle entry {key:?} does not map to a local source")
-        })?;
-        plan.push((key.clone(), root.join(relative), content.as_slice()));
+        let (_, target) = resolve_entry(&roots, key, true)?;
+        plan.push((key.clone(), target, content.as_slice()));
     }
 
     let previous = load_managed(data_dir);
     let mut report = ApplyReport::default();
     let backup_root = data_dir
         .join("backups")
-        .join(chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string());
+        .join(chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ").to_string());
 
-    // Stage everything first so a failure cannot leave a half-written bundle.
-    let mut staged: Vec<(PathBuf, PathBuf, Option<u32>)> = Vec::new();
-    for (key, target, content) in &plan {
-        let existing = fs::read(target).ok();
-        if existing.as_deref() == Some(*content) {
-            report.unchanged += 1;
-            continue;
-        }
-        #[cfg(unix)]
-        let previous_mode = {
-            use std::os::unix::fs::PermissionsExt;
-            fs::metadata(target)
-                .ok()
-                .map(|metadata| metadata.permissions().mode() & 0o777)
-        };
-        #[cfg(not(unix))]
-        let previous_mode: Option<u32> = None;
-        if let Some(existing) = existing.as_ref() {
-            let backup = backup_root.join(key);
-            if let Err(err) = fs::create_dir_all(backup.parent().unwrap_or(&backup_root)) {
-                logger.warn(format!("cannot create backup dir: {err}"));
-            } else if let Err(err) = fs::write(&backup, existing) {
-                logger.warn(format!("cannot back up {}: {err}", target.display()));
-            } else {
-                report.backup_dir = Some(backup_root.clone());
+    // Read and back up every changed file before replacing any of them. A read
+    // or backup failure aborts the update rather than silently losing the only
+    // copy of a local prompt.
+    let mut staged: Vec<StagedWrite> = Vec::new();
+    let staging = (|| -> Result<()> {
+        for (key, target, content) in &plan {
+            let existing = match fs::read(target) {
+                Ok(existing) => Some(existing),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => {
+                    return Err(err).with_context(|| format!("reading {}", target.display()))
+                }
+            };
+            if existing.as_deref() == Some(*content) {
+                report.unchanged += 1;
+                continue;
             }
+            #[cfg(unix)]
+            let previous_mode = {
+                use std::os::unix::fs::PermissionsExt;
+                fs::metadata(target)
+                    .ok()
+                    .map(|metadata| metadata.permissions().mode() & 0o777)
+            };
+            #[cfg(not(unix))]
+            let previous_mode: Option<u32> = None;
+            let backup = if let Some(existing) = existing.as_ref() {
+                let backup = backup_root.join(key);
+                fs::create_dir_all(backup.parent().unwrap_or(&backup_root))
+                    .with_context(|| format!("creating backup dir for {key}"))?;
+                fs::write(&backup, existing)
+                    .with_context(|| format!("backing up {}", target.display()))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&backup, fs::Permissions::from_mode(0o600));
+                }
+                report.backup_dir = Some(backup_root.clone());
+                Some(backup)
+            } else {
+                None
+            };
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            let temp = target.with_file_name(format!(
+                ".{}.psync.tmp",
+                target
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "prompt".to_string())
+            ));
+            fs::write(&temp, content).with_context(|| format!("writing {}", temp.display()))?;
+            staged.push(StagedWrite {
+                temp,
+                target: target.clone(),
+                backup,
+                previous_mode,
+            });
+            report.written.push(key.clone());
         }
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        Ok(())
+    })();
+    if let Err(err) = staging {
+        for item in &staged {
+            let _ = fs::remove_file(&item.temp);
         }
-        let temp = target.with_file_name(format!(
-            ".{}.psync.tmp",
-            target
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_else(|| "prompt".to_string())
-        ));
-        fs::write(&temp, content).with_context(|| format!("writing {}", temp.display()))?;
-        staged.push((temp, target.clone(), previous_mode));
-        report.written.push(key.clone());
+        return Err(err);
     }
 
-    for (temp, target, previous_mode) in &staged {
-        if let Err(err) = crate::util::replace_file(temp, target) {
-            for (temp, _, _) in &staged {
-                let _ = fs::remove_file(temp);
+    for (index, item) in staged.iter().enumerate() {
+        if let Err(err) = crate::util::replace_file(&item.temp, &item.target) {
+            for item in &staged {
+                let _ = fs::remove_file(&item.temp);
             }
-            return Err(err).with_context(|| format!("installing {}", target.display()));
+            let rollback_errors = rollback_writes(&staged, index);
+            let err =
+                anyhow::Error::new(err).context(format!("installing {}", item.target.display()));
+            if rollback_errors.is_empty() {
+                return Err(err);
+            }
+            return Err(err.context(format!(
+                "rollback also failed: {}",
+                rollback_errors.join("; ")
+            )));
         }
         // Keep the mode of an existing file, default new prompts to owner-only.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = previous_mode.unwrap_or(0o600);
-            let _ = fs::set_permissions(target, fs::Permissions::from_mode(mode));
+            let mode = item.previous_mode.unwrap_or(0o600);
+            let _ = fs::set_permissions(&item.target, fs::Permissions::from_mode(mode));
         }
         #[cfg(not(unix))]
-        let _ = previous_mode;
+        let _ = &item.previous_mode;
     }
 
     let current: BTreeSet<&String> = entries.keys().collect();
@@ -361,9 +413,8 @@ pub fn apply(
         if current.contains(old) {
             continue;
         }
-        match resolve_entry(&roots, old) {
-            Some((root, relative)) => {
-                let path = root.join(relative);
+        match resolve_entry(&roots, old, false) {
+            Ok((_, path)) => {
                 if path.is_file() {
                     match fs::remove_file(&path) {
                         Ok(()) => {
@@ -374,7 +425,9 @@ pub fn apply(
                     }
                 }
             }
-            None => logger.warn(format!("cannot remove stale managed entry {old:?}")),
+            Err(err) => logger.warn(format!(
+                "cannot remove stale managed entry {old:?}: {err:#}"
+            )),
         }
     }
 
@@ -389,7 +442,34 @@ pub fn apply(
     Ok(report)
 }
 
+fn rollback_writes(staged: &[StagedWrite], installed: usize) -> Vec<String> {
+    let mut errors = Vec::new();
+    for item in staged[..installed].iter().rev() {
+        let result = (|| -> std::io::Result<()> {
+            if let Some(backup) = &item.backup {
+                let content = fs::read(backup)?;
+                atomic_write(&item.target, &content, false)?;
+            } else if item.target.exists() {
+                fs::remove_file(&item.target)?;
+            }
+            #[cfg(unix)]
+            if let Some(mode) = item.previous_mode {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&item.target, fs::Permissions::from_mode(mode))?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            errors.push(format!("{}: {err}", item.target.display()));
+        }
+    }
+    errors
+}
+
 fn prune_backups(data_dir: &Path, keep: usize, logger: &Logger) {
+    if keep == 0 {
+        return;
+    }
     let root = data_dir.join("backups");
     let entries = match fs::read_dir(&root) {
         Ok(entries) => entries,
@@ -402,7 +482,7 @@ fn prune_backups(data_dir: &Path, keep: usize, logger: &Logger) {
         .collect();
     // Timestamped names sort chronologically.
     dirs.sort();
-    while dirs.len() > keep.max(1) {
+    while dirs.len() > keep {
         let victim = dirs.remove(0);
         if let Err(err) = fs::remove_dir_all(&victim) {
             logger.warn(format!("cannot prune backup {}: {err}", victim.display()));
@@ -513,6 +593,109 @@ mod tests {
         assert!(report.deleted.is_empty());
         assert!(root.join("old.md").exists());
         assert!(root.join("new.md").exists());
+    }
+
+    #[test]
+    fn backup_retention_zero_keeps_every_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let backups = temp.path().join("backups");
+        for name in ["20260101T000000Z", "20260102T000000Z"] {
+            fs::create_dir_all(backups.join(name)).unwrap();
+        }
+        prune_backups(temp.path(), 0, &logger(temp.path()));
+        assert_eq!(fs::read_dir(backups).unwrap().count(), 2);
+        prune_backups(temp.path(), 1, &logger(temp.path()));
+        assert_eq!(
+            fs::read_dir(temp.path().join("backups")).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn rollback_restores_old_files_and_removes_new_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_target = temp.path().join("old.md");
+        let new_target = temp.path().join("new.md");
+        let old_backup = temp.path().join("old.bak");
+        fs::write(&old_target, "new content").unwrap();
+        fs::write(&old_backup, "original content").unwrap();
+        fs::write(&new_target, "created by failed update").unwrap();
+        let staged = vec![
+            StagedWrite {
+                temp: temp.path().join("old.tmp"),
+                target: old_target.clone(),
+                backup: Some(old_backup),
+                previous_mode: None,
+            },
+            StagedWrite {
+                temp: temp.path().join("new.tmp"),
+                target: new_target.clone(),
+                backup: None,
+                previous_mode: None,
+            },
+        ];
+        assert!(rollback_writes(&staged, 2).is_empty());
+        assert_eq!(fs::read_to_string(old_target).unwrap(), "original content");
+        assert!(!new_target.exists());
+    }
+
+    #[test]
+    fn backup_failure_does_not_replace_the_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("target");
+        let data = temp.path().join("state");
+        write(&root.join("prompt.md"), "local original");
+        fs::write(&data, "state is unexpectedly a file").unwrap();
+        let sources = vec![SourceSpec {
+            id: "shared".to_string(),
+            root,
+            globs: vec!["**/*.md".to_string()],
+        }];
+        let entries = BTreeMap::from([(
+            "shared/prompt.md".to_string(),
+            b"server replacement".to_vec(),
+        )]);
+        let log = logger(&temp.path().join("logs"));
+        assert!(apply(&entries, &sources, &data, 3, true, &log).is_err());
+        assert_eq!(
+            fs::read_to_string(sources[0].root.join("prompt.md")).unwrap(),
+            "local original"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_and_deletes_do_not_follow_source_symlinks() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("target");
+        let outside = temp.path().join("outside");
+        let data = temp.path().join("state");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("old.md"), "do not delete").unwrap();
+        symlink(&outside, root.join("linked")).unwrap();
+        let sources = vec![SourceSpec {
+            id: "shared".to_string(),
+            root,
+            globs: vec!["**/*.md".to_string()],
+        }];
+        let log = logger(&data);
+        let entries = BTreeMap::from([(
+            "shared/linked/new.md".to_string(),
+            b"must not escape".to_vec(),
+        )]);
+        assert!(apply(&entries, &sources, &data, 3, true, &log).is_err());
+        assert!(!outside.join("new.md").exists());
+
+        fs::create_dir_all(&data).unwrap();
+        let state = serde_json::json!({"files": ["shared/linked/old.md"]});
+        fs::write(managed_path(&data), serde_json::to_vec(&state).unwrap()).unwrap();
+        apply(&BTreeMap::new(), &sources, &data, 3, true, &log).unwrap();
+        assert_eq!(
+            fs::read_to_string(outside.join("old.md")).unwrap(),
+            "do not delete"
+        );
     }
 
     #[test]

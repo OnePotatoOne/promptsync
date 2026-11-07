@@ -79,6 +79,10 @@ impl FeishuClient {
         )
     }
 
+    pub fn app_id(&self) -> &str {
+        &self.app_id
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.api_base, path)
     }
