@@ -56,7 +56,8 @@ connect_attempts = 3
 
 [feishu]
 # 自建应用（不是群自定义机器人 webhook）。凭据只保存在本机配置目录，绝不提交。
-# 首次启动 `promptsync server` 的向导第 4 步可以一键创建（点链接确认即可）。
+# 首次启动 `promptsync server`（第 4 步）/ `promptsync agent`（第 3 步）
+# 的飞书步骤可以一键创建（点链接确认即可），也可以手动粘贴已有应用。
 enabled = false
 notify_on_recovery = true
 timeout_secs = 10

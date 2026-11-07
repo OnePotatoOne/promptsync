@@ -120,6 +120,15 @@ fn save_binding(data_dir: &Path, binding: &Binding) -> Result<()> {
         .context("writing feishu-binding.json")
 }
 
+/// What the binding is used for. The server reads the private chat as its prompt
+/// control channel; an agent only needs the owner open_id for offline alerts.
+/// The purpose only changes the wording, never the binding logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingPurpose {
+    Server,
+    Agent,
+}
+
 /// First-start binding.
 ///
 /// Order of attempts:
@@ -132,6 +141,7 @@ pub fn ensure_binding(
     prompter: &Prompter,
     logger: &Logger,
     force: bool,
+    purpose: BindingPurpose,
 ) -> Result<Option<Binding>> {
     if !config.feishu.enabled {
         return Ok(None);
@@ -142,6 +152,20 @@ pub fn ensure_binding(
         );
         return Ok(None);
     }
+    let (check_message, success_message, heading, rerun_command) = match purpose {
+        BindingPurpose::Server => (
+            "promptsync：绑定检查，稍后你就可以直接发 prompt 了。",
+            "promptsync 绑定成功。以后直接把纯文本 prompt 发给我，我会覆盖服务端的那个文件。",
+            "=== 绑定飞书机器人 ===",
+            "promptsync server",
+        ),
+        BindingPurpose::Agent => (
+            "promptsync agent：告警绑定检查，稍后离线告警会发到这里。",
+            "promptsync agent 绑定成功。之后离线告警会发到这个私聊。",
+            "=== 绑定飞书告警 ===",
+            "promptsync agent",
+        ),
+    };
     let data_dir = paths.data_dir();
     fs::create_dir_all(&data_dir)?;
     if !force {
@@ -159,10 +183,7 @@ pub fn ensure_binding(
     let configured_owner = config.feishu.app.owner_open_id.trim().to_string();
     if !configured_owner.is_empty() {
         let sent = client
-            .send_text_to_owner(
-                &configured_owner,
-                "promptsync：绑定检查，稍后你就可以直接发 prompt 了。",
-            )
+            .send_text_to_owner(&configured_owner, check_message)
             .context("sending the binding check message")?;
         let binding = Binding {
             chat_id: sent.chat_id,
@@ -184,12 +205,12 @@ pub fn ensure_binding(
 
     if !prompter.enabled() {
         logger.warn(format!(
-            "Feishu app is not bound. Open {app_link} in Feishu, send the bot a message, then re-run `promptsync server` to finish binding."
+            "Feishu app is not bound. Open {app_link} in Feishu, send the bot a message, then re-run `{rerun_command}` to finish binding."
         ));
         return Ok(None);
     }
 
-    println!("\n=== 绑定飞书机器人 ===");
+    println!("\n{heading}");
     println!("1) 用飞书扫描下面的二维码，或直接打开链接：\n   {app_link}\n");
     print_qr(&app_link);
     println!("2) 在打开的机器人私聊里发送任意一句话（例如：绑定）");
@@ -210,10 +231,7 @@ pub fn ensure_binding(
                     "owner_open_id",
                     &format!("\"{}\"", binding.open_id),
                 )?;
-                let _ = client.send_text_to_chat(
-                    &binding.chat_id,
-                    "promptsync 绑定成功。以后直接把纯文本 prompt 发给我，我会覆盖服务端的那个文件。",
-                );
+                let _ = client.send_text_to_chat(&binding.chat_id, success_message);
                 logger.info(format!(
                     "Feishu bound: chat {} owner {}",
                     binding.chat_id, binding.open_id
@@ -245,10 +263,7 @@ pub fn ensure_binding(
         .lookup_open_id(contact.trim())
         .context("resolving the Feishu account")?;
     let sent = client
-        .send_text_to_owner(
-            &open_id,
-            "promptsync 绑定成功。以后直接把纯文本 prompt 发给我即可覆盖服务端文件。",
-        )
+        .send_text_to_owner(&open_id, success_message)
         .context("sending the binding message")?;
     let binding = Binding {
         chat_id: sent.chat_id,

@@ -77,7 +77,7 @@ promptsync --config /etc/promptsync/config.toml status   # 直接指定文件（
   4. 飞书：确认启用 → 默认「一键创建」，点开链接确认后自动填好 `app_id` / `app_secret` 和 owner，并当场完成绑定；已有应用可打开 `https://open.feishu.cn/app` 查看全部应用后手动粘贴；
   5. 摘要确认：显示监听、受管文件、密钥、飞书状态，回车开始运行。
 - **agent 首次启动（4 步）**
-  1. 服务端地址与端口；2. 集群口令；3. 可选的 agent 端飞书告警凭据；4. 摘要确认。
+  1. 服务端地址与端口；2. 集群口令；3. 飞书（和 server 相同的引导：一键创建 / 已有应用 / 扫码绑定，用于离线告警）；4. 摘要确认。
 - **后续启动**：只问一句"直接使用已有配置启动？[Y/n]"；选 `n` 就重新进入向导（所以改配置、重绑飞书都走同一个入口）。
 - 每一步都会**立即写回** `config/config.toml`（保留注释），中途退出也不会丢已填的内容。
 - **不会打扰脚本和服务**：非 TTY、`--non-interactive`、或已用 `--server` / `--port` / `--bind` / `--once` 覆盖时，自动跳过向导。
@@ -248,7 +248,7 @@ agent                         server
 
 ### 5.1 一键创建应用（推荐）
 
-不需要提前去开放平台点一堆按钮。`promptsync server` 向导第 4 步默认就是「一键创建」：
+不需要提前去开放平台点一堆按钮。`promptsync server` 向导第 4 步、`promptsync agent` 向导第 3 步默认就是「一键创建」：
 
 1. 程序向飞书申请一个设备码，打印一个链接和二维码：
    ```
@@ -271,9 +271,9 @@ agent                         server
 - **一键创建**：创建完成即自动绑定，写入 `config/feishu-binding.json`，`owner_open_id` 写回 `config.toml`。
 - **手动粘贴凭据**：校验通过后，程序会打印机器人链接/二维码；你打开私聊随便发一句话，服务端检测到后自动绑定。若 90 秒内没检测到（部分租户不返回私聊会话），会回退让你输入飞书邮箱/手机号主动绑定。
 - **服务启动后还没绑定**：不用重跑。服务端会每隔几秒检查一次，你只要在飞书里给机器人**发一条私聊消息**，就会自动完成绑定并开始工作。
-- **换账号 / 重新绑定**：重新运行 `promptsync server`，在「直接使用已有配置启动？」处选 `n`，第 4 步选「继续使用这个应用？」否，再走一次一键创建或手动流程。没有单独的绑定命令。
+- **换账号 / 重新绑定**：重新运行 `promptsync server` 或 `promptsync agent`，在「直接使用已有配置启动？」处选 `n`，进入飞书步骤后选「继续使用这个应用？」否，再走一次一键创建或手动流程。没有单独的绑定命令。
 
-非交互环境（systemd/launchd/`--non-interactive`）不会进入向导；在终端里手动跑一次 `promptsync server` 配置即可。
+非交互环境（systemd/launchd/`--non-interactive`）不会进入向导；在终端里手动跑一次 `promptsync server` 或 `promptsync agent` 配置即可。
 
 ### 5.3 用飞书私聊覆盖服务端 prompt（控制通道）
 
@@ -313,7 +313,7 @@ promptsync feishu-test                    # 给绑定的账号发一条测试消
 promptsync feishu-test --text "自定义内容"
 ```
 
-> agent 只发告警、不读消息，所以它的配置里只需要 `[feishu.app]` 的 `app_id`、`app_secret`、`owner_open_id` 三项（`owner_open_id` 可在服务端用 `promptsync status --json` 查到），并保持 `[feishu] enabled = true`。
+> agent 只发告警、不读消息，所以它的配置里只需要 `[feishu.app]` 的 `app_id`、`app_secret`、`owner_open_id` 三项，并保持 `[feishu] enabled = true`。运行 `promptsync agent` 的飞书步骤可以一键创建并自动绑定；也可以手动粘贴应用凭据，`owner_open_id` 可在服务端用 `promptsync status --json` 查到。
 >
 > **权限取舍**：飞书应用的权限是应用级的。agent 要自己发离线告警，就需要在自己的机器上配置同一个 `app_id`/`app_secret`（也就意味着那台机器上的凭据具备应用的全部权限）。如果你介意，可以：给 agent 单独创建一个"只发消息"的应用（`im:message:send_as_bot` 即可，不授予只读权限），在 agent 的配置里填那套凭据；服务端仍用完整的应用。两套凭据互不影响。
 

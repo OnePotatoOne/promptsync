@@ -187,7 +187,7 @@ pub fn prepare(
     loop {
         match role {
             Role::Server => server_wizard(&mut config, paths, prompter, logger, total, created)?,
-            Role::Agent => agent_wizard(&mut config, paths, prompter, logger, total)?,
+            Role::Agent => agent_wizard(&mut config, paths, prompter, logger, total, created)?,
         }
         let (reloaded, _) = paths.load()?;
         config = reloaded;
@@ -231,6 +231,7 @@ fn server_wizard(
         prompter,
         logger,
         first_run || config.feishu.enabled,
+        Role::Server,
     )?;
 
     prompter.step(5, total, "确认");
@@ -243,6 +244,7 @@ fn agent_wizard(
     prompter: &Prompter,
     logger: &Logger,
     total: usize,
+    first_run: bool,
 ) -> Result<()> {
     prompter.step(1, total, "服务端地址");
     let server = prompter.text("服务端主机名或 IP", &config.agent.server);
@@ -255,8 +257,15 @@ fn agent_wizard(
     prompter.step(2, total, "集群密钥");
     configure_secret(config, paths, prompter)?;
 
-    prompter.step(3, total, "agent 端飞书告警（可选）");
-    configure_agent_alerts(config, paths, prompter, logger)?;
+    prompter.step(3, total, "飞书（离线告警）");
+    configure_feishu(
+        config,
+        paths,
+        prompter,
+        logger,
+        first_run || config.feishu.enabled,
+        Role::Agent,
+    )?;
 
     prompter.step(4, total, "确认");
     Ok(())
@@ -382,12 +391,16 @@ fn configure_feishu(
     prompter: &Prompter,
     logger: &Logger,
     default_enabled: bool,
+    role: Role,
 ) -> Result<()> {
-    println!("飞书自建应用：私聊发纯文本覆盖 prompt，同时发送离线告警。");
+    match role {
+        Role::Server => println!("飞书自建应用：私聊发纯文本覆盖 prompt，同时发送离线告警。"),
+        Role::Agent => println!("飞书自建应用：离线告警会发到你的私聊。"),
+    }
     if !prompter.confirm("启用飞书？", default_enabled) {
         apply(paths, Some("feishu"), "enabled", "false")?;
         config.feishu.enabled = false;
-        println!("已跳过飞书，稍后重新运行 server 即可再配置。");
+        println!("已跳过飞书，稍后重新运行 {} 即可再配置。", role.label());
         return Ok(());
     }
     apply(paths, Some("feishu"), "enabled", "true")?;
@@ -398,7 +411,7 @@ fn configure_feishu(
     if has_app {
         println!("已配置应用 {}。", mask_id(config.feishu.app.app_id.trim()));
         if prompter.confirm("继续使用这个应用？", true) {
-            return finish_feishu(config, paths, prompter, logger);
+            return finish_feishu(config, paths, prompter, logger, role);
         }
     }
 
@@ -417,24 +430,24 @@ fn configure_feishu(
             if let Err(err) = register_feishu_app(config, paths) {
                 println!("一键创建没有完成：{err:#}");
                 if prompter.confirm("改为手动粘贴 app_id / app_secret？", true) {
-                    manual_feishu_credentials(config, paths, prompter)?;
+                    manual_feishu_credentials(config, paths, prompter, role)?;
                 } else {
                     apply(paths, Some("feishu"), "enabled", "false")?;
                     config.feishu.enabled = false;
-                    println!("已跳过飞书，稍后重新运行 server 即可再配置。");
+                    println!("已跳过飞书，稍后重新运行 {} 即可再配置。", role.label());
                     return Ok(());
                 }
             }
         }
-        1 => manual_feishu_credentials(config, paths, prompter)?,
+        1 => manual_feishu_credentials(config, paths, prompter, role)?,
         _ => {
             apply(paths, Some("feishu"), "enabled", "false")?;
             config.feishu.enabled = false;
-            println!("已跳过飞书，稍后重新运行 server 即可再配置。");
+            println!("已跳过飞书，稍后重新运行 {} 即可再配置。", role.label());
             return Ok(());
         }
     }
-    finish_feishu(config, paths, prompter, logger)
+    finish_feishu(config, paths, prompter, logger, role)
 }
 
 /// Short safe rendering of an app id for prompts/logs.
@@ -521,13 +534,19 @@ fn manual_feishu_credentials(
     config: &mut Config,
     paths: &Paths,
     prompter: &Prompter,
+    role: Role,
 ) -> Result<()> {
     println!(
         "\n打开 https://open.feishu.cn/app ，进入应用 → 凭证与基础信息，复制 app_id / app_secret。"
     );
-    println!(
-        "应用需要机器人能力和 im:message:readonly、im:message:send_as_bot、im:chat:readonly 权限。"
-    );
+    match role {
+        Role::Server => println!(
+            "应用需要机器人能力和 im:message:readonly、im:message:send_as_bot、im:chat:readonly 权限。"
+        ),
+        Role::Agent => println!(
+            "应用至少需要 im:message:send_as_bot；扫码绑定还需要 im:message:readonly、im:chat:readonly。"
+        ),
+    }
     loop {
         let app_id = prompter.text("app_id", &config.feishu.app.app_id);
         let app_secret = prompter.text("app_secret", &config.feishu.app.app_secret);
@@ -561,6 +580,7 @@ fn finish_feishu(
     paths: &Paths,
     prompter: &Prompter,
     logger: &Logger,
+    role: Role,
 ) -> Result<()> {
     print!("校验凭据 … ");
     let _ = io::stdout().flush();
@@ -568,87 +588,57 @@ fn finish_feishu(
         Ok(()) => println!("通过。"),
         Err(err) => {
             println!("失败：{err:#}");
-            println!("应用凭据已保存；可在下次运行 server 时重新配置。");
+            println!("应用凭据已保存；可在下次运行 {} 时重新配置。", role.label());
             return Ok(());
         }
     }
 
     println!();
-    match feishu_control::ensure_binding(config, paths, prompter, logger, true) {
-        Ok(Some(binding)) => println!(
-            "飞书绑定完成：open_id {}（之后直接在这个私聊里发纯文本即可）。",
-            binding.open_id
-        ),
-        Ok(None) => println!("飞书还没完成绑定；服务启动后会自动等待你发来第一条私聊消息。"),
-        Err(err) => println!("飞书绑定失败：{err:#}。服务启动后仍会自动重试。"),
+    // An agent only needs the owner open_id to send alerts. Asking for it here
+    // also supports send-only apps that cannot discover the private chat.
+    if role == Role::Agent && config.feishu.app.owner_open_id.trim().is_empty() {
+        let owner = prompter.text(
+            "告警接收者 open_id（留空则扫码绑定；服务端 status --json 可查）",
+            "",
+        );
+        if !owner.trim().is_empty() {
+            apply(
+                paths,
+                Some("feishu.app"),
+                "owner_open_id",
+                &toml_string(owner.trim()),
+            )?;
+            config.feishu.app.owner_open_id = owner.trim().to_string();
+        }
+    }
+    let purpose = match role {
+        Role::Server => feishu_control::BindingPurpose::Server,
+        Role::Agent => feishu_control::BindingPurpose::Agent,
+    };
+    match feishu_control::ensure_binding(config, paths, prompter, logger, true, purpose) {
+        Ok(Some(binding)) => match role {
+            Role::Server => println!(
+                "飞书绑定完成：open_id {}（之后直接在这个私聊里发纯文本即可）。",
+                binding.open_id
+            ),
+            Role::Agent => {
+                println!("飞书告警已连接：open_id {}。", binding.open_id)
+            }
+        },
+        Ok(None) => match role {
+            Role::Server => {
+                println!("飞书还没完成绑定；服务启动后会自动等待你发来第一条私聊消息。")
+            }
+            Role::Agent => {
+                println!("飞书还没完成绑定；离线告警暂不会发送，重新运行 agent 可再配置。")
+            }
+        },
+        Err(err) => match role {
+            Role::Server => println!("飞书绑定失败：{err:#}。服务启动后仍会自动重试。"),
+            Role::Agent => println!("飞书告警绑定失败：{err:#}。可重新运行 agent 再配置。"),
+        },
     }
     Ok(())
-}
-
-fn configure_agent_alerts(
-    config: &mut Config,
-    paths: &Paths,
-    prompter: &Prompter,
-    logger: &Logger,
-) -> Result<()> {
-    let _ = logger;
-    println!("agent 自己发离线告警需要飞书应用凭据；不配置也不影响 prompt 同步。");
-    if !prompter.confirm("配置 agent 端离线告警？", config.feishu.enabled) {
-        return Ok(());
-    }
-    loop {
-        let app_id = prompter.text("app_id", &config.feishu.app.app_id);
-        let app_secret = prompter.text("app_secret", &config.feishu.app.app_secret);
-        let owner = prompter.text(
-            "告警接收者 open_id（服务端 status --json 可查）",
-            &config.feishu.app.owner_open_id,
-        );
-        if app_id.trim().is_empty() || app_secret.trim().is_empty() || owner.trim().is_empty() {
-            println!("app_id、app_secret、owner_open_id 都需要填写。");
-            if !prompter.confirm("继续填写？", true) {
-                return Ok(());
-            }
-            continue;
-        }
-        apply(paths, Some("feishu"), "enabled", "true")?;
-        apply(
-            paths,
-            Some("feishu.app"),
-            "app_id",
-            &toml_string(app_id.trim()),
-        )?;
-        apply(
-            paths,
-            Some("feishu.app"),
-            "app_secret",
-            &toml_string(app_secret.trim()),
-        )?;
-        apply(
-            paths,
-            Some("feishu.app"),
-            "owner_open_id",
-            &toml_string(owner.trim()),
-        )?;
-        config.feishu.enabled = true;
-        config.feishu.app.app_id = app_id.trim().to_string();
-        config.feishu.app.app_secret = app_secret.trim().to_string();
-        config.feishu.app.owner_open_id = owner.trim().to_string();
-
-        print!("校验凭据 … ");
-        let _ = io::stdout().flush();
-        match FeishuClient::from_config(config).and_then(|client| client.check()) {
-            Ok(()) => {
-                println!("通过。");
-                return Ok(());
-            }
-            Err(err) => {
-                println!("失败：{err:#}");
-                if !prompter.confirm("重新填写？", true) {
-                    return Ok(());
-                }
-            }
-        }
-    }
 }
 
 fn print_summary(config: &Config, paths: &Paths, role: Role) {
