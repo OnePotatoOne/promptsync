@@ -457,7 +457,7 @@ git tag -a v0.1.0 -m "promptsync v0.1.0"
 git push origin v0.1.0
 ```
 
-release 矩阵：`x86_64-unknown-linux-gnu`、`x86_64-unknown-linux-musl`（静态，适合 Alpine/最小镜像）、`aarch64-unknown-linux-gnu`、`aarch64-unknown-linux-musl`、`x86_64-apple-darwin`、`aarch64-apple-darwin`、`x86_64-pc-windows-msvc`。产物就是裸二进制（`promptsync-linux-x86_64`、`promptsync-macos-aarch64`、`promptsync-windows-x86_64.exe` 等）加一个 `SHA256SUMS`，没有压缩包。
+release 矩阵：`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、`x86_64-apple-darwin`、`aarch64-apple-darwin`、`x86_64-pc-windows-msvc`。产物就是裸二进制（`promptsync-linux-x86_64`、`promptsync-macos-aarch64`、`promptsync-windows-x86_64.exe` 等）加一个 `SHA256SUMS`，没有压缩包，也不再提供 musl 静态版。
 
 密钥策略：
 

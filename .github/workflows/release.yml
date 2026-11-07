@@ -47,17 +47,9 @@ jobs:
             target: x86_64-unknown-linux-gnu
             name: promptsync-linux-x86_64
             ext: ""
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-musl
-            name: promptsync-linux-x86_64-musl
-            ext: ""
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             name: promptsync-linux-aarch64
-            ext: ""
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-            name: promptsync-linux-aarch64-musl
             ext: ""
           # macOS 14 runners were retired on 2026-11-02; use macOS 15.
           - os: macos-15-intel
@@ -83,9 +75,6 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-      - name: Install musl tools
-        if: endsWith(matrix.target, '-musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
       # Release assets are the bare executables: no tar.gz, no zip.
