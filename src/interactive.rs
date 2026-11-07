@@ -594,6 +594,28 @@ fn finish_feishu(
     }
 
     println!();
+    // Agents only need a recipient for alerts. QR discovery needs permission to
+    // read private chats, which send-only apps do not have, and some tenants do
+    // not list p2p chats at all. Ask for the owner directly instead.
+    if role == Role::Agent && config.feishu.app.owner_open_id.trim().is_empty() {
+        let owner = prompter.text(
+            "告警接收者 open_id（服务端 status --json 可查；留空则跳过离线告警）",
+            "",
+        );
+        if owner.trim().is_empty() {
+            println!(
+                "已跳过飞书告警绑定；prompt 同步不受影响。之后可在 config.toml 的 [feishu.app] 填写 owner_open_id。"
+            );
+            return Ok(());
+        }
+        apply(
+            paths,
+            Some("feishu.app"),
+            "owner_open_id",
+            &toml_string(owner.trim()),
+        )?;
+        config.feishu.app.owner_open_id = owner.trim().to_string();
+    }
     let purpose = match role {
         Role::Server => feishu_control::BindingPurpose::Server,
         Role::Agent => feishu_control::BindingPurpose::Agent,
