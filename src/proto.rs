@@ -31,6 +31,13 @@ pub struct Manifest {
     /// adapting it to local client configs. Empty on older servers.
     #[serde(default)]
     pub target: String,
+    /// Feishu app id and bound owner. Agents that use the same app can inherit
+    /// the recipient automatically instead of asking the user to paste an
+    /// open_id. Both are empty when the server has no Feishu binding.
+    #[serde(default)]
+    pub feishu_app_id: String,
+    #[serde(default)]
+    pub feishu_owner_open_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

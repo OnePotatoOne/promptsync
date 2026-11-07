@@ -268,6 +268,9 @@ pub fn ensure_binding(
 
     let deadline =
         Instant::now() + Duration::from_secs(config.feishu.control.bind_timeout_secs.max(15));
+    let mut last_error: Option<String> = None;
+    let discovery_started = Instant::now();
+    let mut showed_discovery_hint = false;
     while Instant::now() < deadline {
         match discover_p2p_binding(&client, &challenge) {
             Ok(Some(binding)) => {
@@ -285,8 +288,22 @@ pub fn ensure_binding(
                 ));
                 return Ok(Some(binding));
             }
-            Ok(None) => {}
-            Err(err) => logger.debug(format!("Feishu binding poll failed: {err:#}")),
+            Ok(None) => {
+                if !showed_discovery_hint && discovery_started.elapsed() >= Duration::from_secs(10)
+                {
+                    println!("还没有发现绑定码。部分租户不会返回机器人私聊；等待结束后可直接输入 open_id 绑定。");
+                    showed_discovery_hint = true;
+                }
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                logger.warn(format!("Feishu binding poll failed: {message}"));
+                if last_error.as_deref() != Some(&message) {
+                    println!("绑定轮询失败：{message}");
+                    println!("请检查 im:message:readonly / im:chat:readonly 权限；也可以等待结束后直接输入 open_id。");
+                    last_error = Some(message);
+                }
+            }
         }
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -295,7 +312,7 @@ pub fn ensure_binding(
         let configured = config.feishu.control.bind_contact.trim().to_string();
         if configured.is_empty() {
             prompter.text(
-                "未检测到私聊消息。可输入飞书账号邮箱/手机号完成绑定（留空取消）",
+                "未检测到绑定码。输入授权账号的 open_id、飞书邮箱或手机号直接绑定（留空取消）",
                 "",
             )
         } else {
@@ -306,9 +323,13 @@ pub fn ensure_binding(
         logger.warn("Feishu binding cancelled");
         return Ok(None);
     }
-    let open_id = client
-        .lookup_open_id(contact.trim())
-        .context("resolving the Feishu account")?;
+    let open_id = if contact.trim().starts_with("ou_") {
+        contact.trim().to_string()
+    } else {
+        client
+            .lookup_open_id(contact.trim())
+            .context("resolving the Feishu account")?
+    };
     let sent = client
         .send_text_to_owner(&open_id, success_message)
         .context("sending the binding message")?;
@@ -482,6 +503,7 @@ pub async fn run(
                 &config_file,
                 poll_secs,
                 &logger,
+                BindingPurpose::Server,
             )
             .await?
         }
@@ -520,9 +542,12 @@ pub async fn run(
     }
 }
 
-/// Wait for the first private message (or for a configured owner to accept a
-/// hello) and persist the binding. Runs until it succeeds, so enabling Feishu
-/// without finishing the wizard still starts working after one message.
+/// Wait for the one-time binding code and persist the binding.
+///
+/// Both roles use the same private-chat discovery: the server needs the chat
+/// for prompt control, while an agent only needs the owner open_id for alerts.
+/// Running this as a background task means a code sent after startup is still
+/// processed (the wizard's short wait is not the only chance to bind).
 async fn bind_loop(
     config: &Config,
     client: &Arc<FeishuClient>,
@@ -530,12 +555,22 @@ async fn bind_loop(
     config_file: &Path,
     poll_secs: u64,
     logger: &Logger,
+    purpose: BindingPurpose,
 ) -> Result<Binding> {
+    let success_message = match purpose {
+        BindingPurpose::Server => {
+            "promptsync 绑定成功。以后直接把纯文本 prompt 发给我，我会覆盖服务端的那个文件。"
+        }
+        BindingPurpose::Agent => "promptsync agent 绑定成功。之后离线告警会发到这个私聊。",
+    };
     let mut challenge = BindingChallenge::new();
     logger.info(format!(
         "Feishu: 尚未绑定。请用需要授权的账号在机器人私聊中只发送一次性绑定码 {}（15 分钟内有效）；发送普通消息不会获得控制权",
         challenge.code
     ));
+    logger.warn(
+        "如果发送绑定码后没有反应，说明当前租户可能不返回 p2p 私聊，或应用缺少 im:message:readonly / im:chat:readonly 权限；可改为在 config.toml 的 [feishu.app] 填写 owner_open_id",
+    );
     let mut last_error: Option<String> = None;
     loop {
         if challenge.expired(now_unix()) {
@@ -560,10 +595,7 @@ async fn bind_loop(
                     "owner_open_id",
                     &format!("\"{}\"", binding.open_id),
                 );
-                let _ = client.send_text_to_chat(
-                    &binding.chat_id,
-                    "promptsync 绑定成功。以后直接把纯文本 prompt 发给我，我会覆盖服务端的那个文件。",
-                );
+                let _ = client.send_text_to_chat(&binding.chat_id, success_message);
                 logger.info(format!(
                     "Feishu bound: chat {} owner {}",
                     binding.chat_id, binding.open_id
@@ -586,6 +618,28 @@ async fn bind_loop(
         }
         tokio::time::sleep(Duration::from_secs(poll_secs)).await;
     }
+}
+
+/// Background binding used by an agent. It keeps polling until a code arrives,
+/// then writes both `feishu-binding.json` and `feishu.app.owner_open_id`.
+pub async fn bind_agent(
+    config: &Config,
+    data_dir: &Path,
+    config_file: &Path,
+    logger: &Logger,
+) -> Result<Binding> {
+    let client = Arc::new(FeishuClient::from_config(config)?);
+    let poll_secs = config.feishu.control.poll_secs.max(2);
+    bind_loop(
+        config,
+        &client,
+        data_dir,
+        config_file,
+        poll_secs,
+        logger,
+        BindingPurpose::Agent,
+    )
+    .await
 }
 
 /// One binding attempt: a configured owner is pinged directly; otherwise we

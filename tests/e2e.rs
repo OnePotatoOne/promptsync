@@ -138,6 +138,8 @@ async fn poll(cluster: &Cluster, agent_id: &str) -> anyhow::Result<SyncOutcome> 
         &data_dir,
         None,
         &cluster.agent_logger,
+        None,
+        None,
     )
     .await
 }

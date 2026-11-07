@@ -598,27 +598,32 @@ fn finish_feishu(
     }
 
     println!();
-    // Agents only need a recipient for alerts. QR discovery needs permission to
-    // read private chats, which send-only apps do not have, and some tenants do
-    // not list p2p chats at all. Ask for the owner directly instead.
-    if role == Role::Agent && config.feishu.app.owner_open_id.trim().is_empty() {
-        let owner = prompter.text(
-            "告警接收者 open_id（服务端 status --json 可查；留空则跳过离线告警）",
-            "",
-        );
+    // Some tenants do not return p2p chats through the chat-list API, and
+    // send-only apps cannot read messages at all. A configured recipient works
+    // in both cases, so offer direct binding before trying QR discovery.
+    if config.feishu.app.owner_open_id.trim().is_empty() {
+        let label = match role {
+            Role::Server => "授权账号 open_id（直接绑定最可靠；留空则尝试一次性绑定码）",
+            Role::Agent => "告警接收者 open_id（服务端 status --json 可查；留空则跳过离线告警）",
+        };
+        let owner = prompter.text(label, "");
         if owner.trim().is_empty() {
-            println!(
-                "已跳过飞书告警绑定；prompt 同步不受影响。之后可在 config.toml 的 [feishu.app] 填写 owner_open_id。"
-            );
-            return Ok(());
+            if role == Role::Agent {
+                println!(
+                    "不填也可以：启动后日志会打印一次性绑定码，用授权账号在机器人私聊里发送即可；agent 会持续等待绑定，不需要手动粘贴 open_id。"
+                );
+                return Ok(());
+            }
+            println!("部分租户不会返回机器人私聊；若绑定码无响应，请重新运行并填写 open_id。");
+        } else {
+            apply(
+                paths,
+                Some("feishu.app"),
+                "owner_open_id",
+                &toml_string(owner.trim()),
+            )?;
+            config.feishu.app.owner_open_id = owner.trim().to_string();
         }
-        apply(
-            paths,
-            Some("feishu.app"),
-            "owner_open_id",
-            &toml_string(owner.trim()),
-        )?;
-        config.feishu.app.owner_open_id = owner.trim().to_string();
     }
     let purpose = match role {
         Role::Server => feishu_control::BindingPurpose::Server,

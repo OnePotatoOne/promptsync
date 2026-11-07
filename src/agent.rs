@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -15,6 +15,7 @@ use crate::buildinfo;
 use crate::config::Config;
 use crate::crypto::{ClientHello, ClusterSecret, KnockSequence, MAX_CLOCK_SKEW_SECS, TYPE_READY};
 use crate::feishu;
+use crate::feishu_control;
 use crate::knock::{agent_ports, random_count, random_plan, Ports};
 use crate::logx::Logger;
 use crate::prompts::{
@@ -293,6 +294,54 @@ async fn send_bye(channel: &mut Channel, agent_id: &str) {
     }
 }
 
+/// Copy the server's Feishu recipient when both sides use the same app.
+///
+/// Feishu open_ids are app-scoped, so this is only valid when the app id
+/// matches. The agent still falls back to its own one-time-code binding loop
+/// when the app differs or the server has no recipient yet.
+fn adopt_feishu_owner(
+    config: &Config,
+    manifest: &crate::proto::Manifest,
+    owner: &Arc<Mutex<Option<String>>>,
+    config_file: Option<&Path>,
+    logger: &Logger,
+) {
+    if !config.feishu.enabled {
+        return;
+    }
+    let app_id = config.feishu.app.app_id.trim();
+    if app_id.is_empty() || manifest.feishu_app_id.trim() != app_id {
+        return;
+    }
+    let incoming = manifest.feishu_owner_open_id.trim();
+    if incoming.is_empty() {
+        return;
+    }
+    let mut guard = match owner.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    if guard.is_some() {
+        return;
+    }
+    *guard = Some(incoming.to_string());
+    drop(guard);
+    if let Some(path) = config_file {
+        let literal = serde_json::to_string(incoming).unwrap_or_else(|_| format!("\"{incoming}\""));
+        if let Err(err) =
+            crate::config::set_value(path, Some("feishu.app"), "owner_open_id", &literal)
+        {
+            logger.warn(format!(
+                "adopted Feishu owner from server but could not persist it: {err:#}"
+            ));
+        }
+    }
+    logger.info(format!(
+        "adopted Feishu owner {} from server (same app {})",
+        incoming, app_id
+    ));
+}
+
 /// One complete poll cycle. `previous` is used to recognise a server bundle
 /// that could only be applied partially (unknown local source).
 #[allow(clippy::too_many_arguments)]
@@ -305,6 +354,8 @@ pub async fn sync_once(
     data_dir: &Path,
     previous: Option<&AgentState>,
     logger: &Logger,
+    feishu_owner: Option<&Arc<Mutex<Option<String>>>>,
+    config_file: Option<&Path>,
 ) -> Result<SyncOutcome> {
     let scan_options = ScanOptions::from(&config.sync);
     let local_entries = scan(sources, &scan_options, Some(logger))?;
@@ -348,6 +399,9 @@ pub async fn sync_once(
             bail!("unexpected server response: {other:?}");
         }
     };
+    if let Some(owner) = feishu_owner {
+        adopt_feishu_owner(config, &manifest, owner, config_file, logger);
+    }
 
     if manifest.hash == local_hash
         || previous
@@ -529,11 +583,64 @@ impl OfflineTracker {
     }
 }
 
-fn spawn_feishu(config: &Config, logger: &Logger, text: String) {
-    feishu::spawn_notify(config, logger, text);
+fn spawn_feishu(
+    config: &Config,
+    logger: &Logger,
+    owner: &Arc<Mutex<Option<String>>>,
+    text: String,
+) {
+    let mut config = config.clone();
+    if let Some(owner) = owner.lock().ok().and_then(|guard| guard.clone()) {
+        config.feishu.app.owner_open_id = owner;
+    }
+    feishu::spawn_notify(&config, logger, text);
 }
 
-pub async fn run(config: Config, logger: Logger, data_dir: PathBuf) -> Result<()> {
+/// Start the background one-time-code binding loop when the agent has no
+/// recipient yet. The task keeps running after startup, unlike the wizard's
+/// short wait, and updates the shared owner cell as soon as it binds.
+fn spawn_feishu_binding(
+    config: &Config,
+    logger: &Logger,
+    data_dir: &Path,
+    config_file: &Path,
+    owner: &Arc<Mutex<Option<String>>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !config.feishu.enabled || !config.feishu_app_configured() {
+        return None;
+    }
+    if owner.lock().ok().and_then(|guard| guard.clone()).is_some() {
+        return None;
+    }
+    let config = config.clone();
+    let logger = logger.clone();
+    let data_dir = data_dir.to_path_buf();
+    let config_file = config_file.to_path_buf();
+    let owner = Arc::clone(owner);
+    Some(tokio::spawn(async move {
+        match feishu_control::bind_agent(&config, &data_dir, &config_file, &logger).await {
+            Ok(binding) => {
+                if let Ok(mut guard) = owner.lock() {
+                    *guard = Some(binding.open_id.clone());
+                }
+                logger.info(format!(
+                    "Feishu alert binding ready: open_id {}",
+                    binding.open_id
+                ));
+            }
+            Err(err) => logger.warn(format!(
+                "Feishu alert binding stopped; offline alerts will not send: {err:#}"
+            )),
+        }
+    }))
+}
+
+pub async fn run(
+    config: Config,
+    logger: Logger,
+    data_dir: PathBuf,
+    config_file: PathBuf,
+) -> Result<()> {
     config.validate()?;
     let secret = Arc::new(
         ClusterSecret::resolve(&config.cluster_secret).context("resolving cluster secret")?,
@@ -575,6 +682,29 @@ pub async fn run(config: Config, logger: Logger, data_dir: PathBuf) -> Result<()
         data_dir.display()
     ));
 
+    // A recipient may already be configured, or a previous binding may still
+    // be valid even if config.toml has no owner_open_id. Reuse it before
+    // starting another binding loop.
+    let mut initial_owner = config.feishu.app.owner_open_id.trim().to_string();
+    if initial_owner.is_empty() {
+        if let Some(binding) = feishu_control::load_binding(&data_dir) {
+            if binding.app_id == config.feishu.app.app_id.trim()
+                && !binding.open_id.trim().is_empty()
+            {
+                initial_owner = binding.open_id;
+            }
+        }
+    }
+    let feishu_owner = Arc::new(Mutex::new(if initial_owner.is_empty() {
+        None
+    } else {
+        Some(initial_owner)
+    }));
+    // Start the code-binding task only after the first sync. The first
+    // manifest may already carry the server's owner; in that case there is
+    // nothing to bind and the user never sees a code.
+    let mut binding_task: Option<tokio::task::JoinHandle<()>> = None;
+
     loop {
         let cycle_start = Instant::now();
         let result = sync_once(
@@ -586,6 +716,8 @@ pub async fn run(config: Config, logger: Logger, data_dir: PathBuf) -> Result<()
             &data_dir,
             Some(&state),
             &logger,
+            Some(&feishu_owner),
+            Some(&config_file),
         )
         .await;
         match result {
@@ -629,6 +761,7 @@ pub async fn run(config: Config, logger: Logger, data_dir: PathBuf) -> Result<()
                         spawn_feishu(
                             &config,
                             &logger,
+                            &feishu_owner,
                             feishu::recovery_message(
                                 "agent",
                                 &agent_id,
@@ -664,6 +797,7 @@ pub async fn run(config: Config, logger: Logger, data_dir: PathBuf) -> Result<()
                     spawn_feishu(
                         &config,
                         &logger,
+                        &feishu_owner,
                         feishu::offline_alert(
                             "agent",
                             &agent_id,
@@ -678,6 +812,26 @@ pub async fn run(config: Config, logger: Logger, data_dir: PathBuf) -> Result<()
                     );
                 }
             }
+        }
+
+        if binding_task
+            .as_ref()
+            .map(|handle| handle.is_finished())
+            .unwrap_or(true)
+        {
+            binding_task = None;
+        }
+        if feishu_owner
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+        {
+            if let Some(handle) = binding_task.take() {
+                handle.abort();
+            }
+        } else if binding_task.is_none() {
+            binding_task =
+                spawn_feishu_binding(&config, &logger, &data_dir, &config_file, &feishu_owner);
         }
 
         let elapsed = cycle_start.elapsed();
@@ -706,6 +860,8 @@ pub async fn run_once(config: Config, logger: Logger, data_dir: PathBuf) -> Resu
         &data_dir,
         Some(&state),
         &logger,
+        None,
+        None,
     )
     .await?;
     state.agent_id = agent_id;
@@ -755,6 +911,55 @@ mod tests {
         assert!(!tracker.on_failure());
         std::thread::sleep(Duration::from_millis(1100));
         assert!(tracker.on_failure());
+    }
+
+    #[test]
+    fn adopts_the_server_feishu_owner_only_for_the_same_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_file = dir.path().join("config.toml");
+        std::fs::write(
+            &config_file,
+            "[feishu.app]\napp_id = \"cli_test\"\napp_secret = \"secret\"\nowner_open_id = \"\"\n",
+        )
+        .unwrap();
+        let logger = crate::logx::Logger::new(
+            &dir.path().join("logs"),
+            "test.log",
+            crate::logx::Level::Info,
+            1024,
+            1,
+            false,
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.feishu.enabled = true;
+        config.feishu.app.app_id = "cli_test".to_string();
+        config.feishu.app.app_secret = "secret".to_string();
+        let owner = Arc::new(Mutex::new(None));
+        let manifest = crate::proto::Manifest {
+            epoch: 1,
+            hash: "hash".to_string(),
+            files: 0,
+            bytes: 0,
+            updated_unix: 0,
+            target: String::new(),
+            feishu_app_id: "cli_test".to_string(),
+            feishu_owner_open_id: "ou_owner".to_string(),
+        };
+
+        adopt_feishu_owner(&config, &manifest, &owner, Some(&config_file), &logger);
+        assert_eq!(owner.lock().unwrap().as_deref(), Some("ou_owner"));
+        assert!(std::fs::read_to_string(&config_file)
+            .unwrap()
+            .contains("owner_open_id = \"ou_owner\""));
+
+        let other_owner = Arc::new(Mutex::new(None));
+        let other_app = crate::proto::Manifest {
+            feishu_app_id: "cli_other".to_string(),
+            ..manifest
+        };
+        adopt_feishu_owner(&config, &other_app, &other_owner, None, &logger);
+        assert!(other_owner.lock().unwrap().is_none());
     }
 
     #[test]

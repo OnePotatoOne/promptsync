@@ -531,6 +531,18 @@ async fn session_task(
                     snapshot.epoch,
                     short_hash(&snapshot.hash)
                 ));
+                let (feishu_app_id, feishu_owner_open_id) = if state.config.feishu.enabled {
+                    let app_id = state.config.feishu.app.app_id.trim().to_string();
+                    let binding_owner = crate::feishu_control::load_binding(&state.data_dir)
+                        .filter(|binding| binding.app_id == app_id)
+                        .map(|binding| binding.open_id)
+                        .filter(|owner| !owner.trim().is_empty());
+                    let configured_owner = state.config.feishu.app.owner_open_id.trim();
+                    let owner = binding_owner.unwrap_or_else(|| configured_owner.to_string());
+                    (app_id, owner)
+                } else {
+                    (String::new(), String::new())
+                };
                 let manifest = Manifest {
                     epoch: snapshot.epoch,
                     hash: snapshot.hash.clone(),
@@ -538,6 +550,8 @@ async fn session_task(
                     bytes: total_bytes(&snapshot.entries),
                     updated_unix: snapshot.updated_unix,
                     target: state.config.sync.target.clone(),
+                    feishu_app_id,
+                    feishu_owner_open_id,
                 };
                 if reply(&mut channel, &state.config, &Response::Status(manifest))
                     .await

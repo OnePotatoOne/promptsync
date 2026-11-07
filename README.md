@@ -8,7 +8,7 @@
 - **服务端（server）** 是唯一权威源：本地 prompt 一变，就重新计算 SHA-256 并递增 epoch。
 - **客户端（agent）** 每 10 秒向服务端校验 hash；不一致就拉取整包，原子写入本地，记录日志。
 - 传输走 **UDP**：先做**随机端口敲门**，敲门成功前数据端口根本不绑定；握手用 **X25519 + 预共享密钥认证**，数据用 **AES-256-GCM**，带防重放窗口。
-- 连续 **2 分钟**失联自动通过**飞书自建应用**发离线告警（恢复后可选恢复通知）。
+- 连续 **2 分钟**失联自动通过**飞书自建应用**发离线告警（恢复后可选恢复通知）；agent 与 server 使用同一个飞书应用时，会自动继承 server 的告警接收人，不用手动粘贴 `open_id`。
 - 绑定后可以直接给机器人**私聊发纯文本**，服务端自动覆盖唯一那个 prompt 文件，agent 再自动同步。
 - agent 拉取后**自动适配本机客户端**：Codex、Claude Code、Kimi、DeepSeek、Cindy 的全局指令文件一起更新，覆盖前自动备份。
 - **首次启动自动生成随机集群密钥**并写入本机配置（同时打印一次）；仓库和发布产物里没有固定密钥。其他机器用同一串密钥或同一句口令对齐。
@@ -37,7 +37,7 @@ cargo build --release
 
 飞书使用**自建应用**，`app_id`/`app_secret` 只保存在本机配置目录，**不会编进二进制**。
 
-> Release 里直接是**裸可执行文件**（没有 tar.gz / zip），文件名带版本号：Linux/macOS 为 `promptsync-<版本>-<平台>`（如 `promptsync-0.2.5-macos-aarch64`），Windows 为 `promptsync-<版本>-windows-x86_64.exe`。配置模板已经编译进二进制，首次启动自动生成，不需要额外的 README、模板或安装脚本。下载后 `chmod +x` 即可运行。
+> Release 里直接是**裸可执行文件**（没有 tar.gz / zip），文件名带版本号：Linux/macOS 为 `promptsync-<版本>-<平台>`（如 `promptsync-0.2.6-macos-aarch64`），Windows 为 `promptsync-<版本>-windows-x86_64.exe`。配置模板已经编译进二进制，首次启动自动生成，不需要额外的 README、模板或安装脚本。下载后 `chmod +x` 即可运行。
 
 Release 二进制本身不包含集群密钥；每台机器首次运行生成自己的密钥，复制 server 打印的那一串到 agent 即可。**不同机器默认互不信任**，这是刻意设计。
 
@@ -79,7 +79,7 @@ promptsync --config /etc/promptsync/config.toml status   # 直接指定文件（
   4. 飞书：确认启用 → 默认「一键创建」，点开链接确认后自动填好 `app_id` / `app_secret` 和 owner，并当场完成绑定；已有应用可打开 `https://open.feishu.cn/app` 查看全部应用后手动粘贴；
   5. 摘要确认：显示监听、受管文件、密钥、飞书状态，回车开始运行。
 - **agent 首次启动（4 步）**
-  1. 服务端地址与端口；2. 集群密钥（首次启动自动生成并打印，可粘贴 server 的密钥）；3. 飞书（一键创建会自动带接收人；手动粘贴应用时填一次 `owner_open_id`，留空则跳过告警）；4. 摘要确认。
+  1. 服务端地址与端口；2. 集群密钥（首次启动自动生成并打印，可粘贴 server 的密钥）；3. 飞书（一键创建会自动带接收人；手动粘贴应用时可填 `owner_open_id`，留空也可以：启动后日志会打印一次性绑定码，agent 会持续等待，不需要手动粘贴）；4. 摘要确认。
 - **首次启动的密钥**：server/agent 启动时若配置里没有密钥，会立即生成一个并打印完整 hex、指纹和配置文件路径；最后摘要还会再显示一次。以后用 `promptsync secret --show` 查看，或直接打开 `config.toml` 的 `cluster_secret`。
 - **后续启动**：只问一句"直接使用已有配置启动？[Y/n]"；选 `n` 就重新进入向导（所以改配置、重绑飞书都走同一个入口）。
 - 每一步都会**立即写回** `config/config.toml`（保留注释），中途退出也不会丢已填的内容。
@@ -274,8 +274,8 @@ agent                         server
 ### 5.2 绑定与重新绑定
 
 - **一键创建**：创建完成即自动绑定，写入 `config/feishu-binding.json`，`owner_open_id` 写回 `config.toml`。
-- **手动粘贴凭据**：校验通过后，程序会打印机器人链接/二维码和一次性绑定码；你打开私聊，只发送这个绑定码即可完成绑定。普通私聊消息和绑定开始前的历史消息都不会获得控制权。若 90 秒内没检测到（部分租户不返回私聊会话），会回退让你输入飞书邮箱/手机号主动绑定。
-- **服务启动后还没绑定**：不用重跑。服务端日志会输出有效期 15 分钟的一次性绑定码；你在飞书里用需要授权的账号向机器人私聊发送该码，就会自动完成绑定并开始工作。过期后日志会给出新码。
+- **手动粘贴凭据**：校验通过后，优先填写授权账号的 `owner_open_id`，程序直接给该账号发消息并取得私聊 `chat_id`，不依赖私聊发现。留空才会尝试一次性绑定码；普通私聊消息和绑定开始前的历史消息都不会获得控制权。部分租户不通过接口返回 p2p 私聊，此时绑定码无法被程序发现，等待结束后可直接输入 `open_id`，或输入飞书邮箱/手机号（需要通讯录权限）完成绑定。轮询接口报错会立即显示，不再只写 debug 日志。
+- **服务启动后还没绑定**：不用重跑。server/agent 日志都会输出有效期 15 分钟的一次性绑定码；你在飞书里用需要授权的账号向机器人私聊发送该码，就会自动完成绑定并开始工作，过期后日志会给出新码。agent 与 server 同 app 时还会自动继承 server 的 `owner_open_id`，通常连码都不用发。
 - **换账号 / 重新绑定**：重新运行 `promptsync server` 或 `promptsync agent`，在「直接使用已有配置启动？」处选 `n`，进入飞书步骤后选「继续使用这个应用？」否，再走一次一键创建或手动流程。没有单独的绑定命令。绑定记录同时核对 `app_id` 与 `owner_open_id`；更换应用或接收人后，旧绑定不会被继续使用。
 
 非交互环境（systemd/launchd/`--non-interactive`）不会进入向导；在终端里手动跑一次 `promptsync server` 或 `promptsync agent` 配置即可。
@@ -318,7 +318,7 @@ promptsync feishu-test                    # 给绑定的账号发一条测试消
 promptsync feishu-test --text "自定义内容"
 ```
 
-> agent 只发告警、不读消息，所以它的配置里只需要 `[feishu.app]` 的 `app_id`、`app_secret`、`owner_open_id` 三项，并保持 `[feishu] enabled = true`。运行 `promptsync agent` 的飞书步骤时，一键创建会自动填入接收人；手动粘贴应用凭据时，向导会要求填一次 `owner_open_id`（服务端 `promptsync status --json` 可查），留空则跳过离线告警。agent 不走扫码绑定：只发消息的应用没有读取私聊的权限，扫码发现不了会话，部分租户也不会返回 p2p 会话。
+> agent 平时只用 Feishu 发告警，不读 prompt 内容；绑定阶段会读取机器人私聊里的一次性绑定码，绑定完成后只保留接收人。它的配置里需要 `[feishu.app]` 的 `app_id`、`app_secret`，并保持 `[feishu] enabled = true`；`owner_open_id` 可以从 server 自动继承，也可以留空，让启动后的绑定循环用一次性码补上。如果 agent 与 server 使用同一个 app，server 已绑定时 agent 会在下一次同步自动继承接收人；只有 app 不同或 server 尚未绑定时才需要一次性码。只授予 `im:message:send_as_bot` 的应用无法读取私聊，无法用绑定码，但可以自动继承同一个 app 的 server owner。
 >
 > **权限取舍**：飞书应用的权限是应用级的。agent 要自己发离线告警，就需要在自己的机器上配置同一个 `app_id`/`app_secret`（也就意味着那台机器上的凭据具备应用的全部权限）。如果你介意，可以：给 agent 单独创建一个"只发消息"的应用（`im:message:send_as_bot` 即可，不授予只读权限），在 agent 的配置里填那套凭据；服务端仍用完整的应用。两套凭据互不影响。
 
@@ -487,7 +487,7 @@ release 矩阵：`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、`x86
 | `bundle too large` | 调大 `sync.max_bundle_bytes`（单条加密消息上限约 4.4 MiB，base64 后实际可传约 3 MiB） |
 | 时间戳相关错误 | 两端系统时钟偏差：敲门容忍 ±60s，握手 ±600s，先校时（NTP） |
 | 端口被占用 | `server.port` 与其他服务冲突；数据端口只在敲门后绑定，但配置端口仍需唯一 |
-| 飞书没绑定成功 | 一键创建会自动绑定；手动粘贴凭据时，用授权账号向机器人私聊发送向导或日志中的一次性绑定码即可，服务启动后也会持续等待绑定，不必重跑 |
+| 飞书没绑定成功 | 一键创建会自动绑定；agent 与 server 同 app 时会自动继承 server 的 owner。否则用授权账号向机器人私聊发送日志中的一次性绑定码；agent/server 启动后都会持续等待，不必重跑 |
 | 飞书返回 99991663 / permission denied | `app_id`/`app_secret` 不对，或应用没发布、没授予 `im:message:readonly` / `im:message:send_as_bot` |
 | 发消息没反应 | 必须是在**绑定的私聊**里由你本人发**纯文本**；群聊、他人、富文本都会被忽略（日志里有原因） |
 | 覆盖后 agent 没更新 | 确认 `sync.target` 指向的文件确实在 server 的 source glob 内，且 `promptsync status` 的 hash 已变化 |

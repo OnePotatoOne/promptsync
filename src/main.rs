@@ -232,7 +232,7 @@ async fn dispatch(cli: Cli) -> Result<u8> {
                 return agent::run_once(config, logger, paths.data_dir()).await;
             }
             tokio::select! {
-                result = agent::run(config, logger.clone(), paths.data_dir()) => result?,
+                result = agent::run(config, logger.clone(), paths.data_dir(), paths.config_file.clone()) => result?,
                 _ = shutdown_signal() => logger.info("shutdown signal received"),
             }
             Ok(0)
