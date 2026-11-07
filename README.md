@@ -35,7 +35,7 @@ cargo build --release
 
 飞书使用**自建应用**，`app_id`/`app_secret` 只保存在本机配置目录，**不会编进二进制**。
 
-> Release 里直接是**裸可执行文件**（没有 tar.gz / zip）：Linux/macOS 为 `promptsync-<平台>`，Windows 为 `promptsync-windows-x86_64.exe`。配置模板已经编译进二进制，首次启动自动生成，不需要额外的 README、模板或安装脚本。下载后 `chmod +x` 即可运行。
+> Release 里直接是**裸可执行文件**（没有 tar.gz / zip），文件名带版本号：Linux/macOS 为 `promptsync-<版本>-<平台>`（如 `promptsync-0.2.2-macos-aarch64`），Windows 为 `promptsync-<版本>-windows-x86_64.exe`。配置模板已经编译进二进制，首次启动自动生成，不需要额外的 README、模板或安装脚本。下载后 `chmod +x` 即可运行。
 
 同一次 `cargo build` 产出的 server 和 agent 天然共享密钥；**不同次编译**的二进制默认互不信任，这是刻意设计。
 
@@ -457,7 +457,7 @@ git tag -a v0.1.0 -m "promptsync v0.1.0"
 git push origin v0.1.0
 ```
 
-release 矩阵：`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、`x86_64-apple-darwin`、`aarch64-apple-darwin`、`x86_64-pc-windows-msvc`。产物就是裸二进制（`promptsync-linux-x86_64`、`promptsync-macos-aarch64`、`promptsync-windows-x86_64.exe` 等）加一个 `SHA256SUMS`，没有压缩包，也不再提供 musl 静态版。
+release 矩阵：`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、`x86_64-apple-darwin`、`aarch64-apple-darwin`、`x86_64-pc-windows-msvc`。产物就是带版本号的裸二进制（`promptsync-<版本>-linux-x86_64`、`promptsync-<版本>-macos-aarch64`、`promptsync-<版本>-windows-x86_64.exe` 等）加一个 `SHA256SUMS`，没有压缩包，也不再提供 musl 静态版。
 
 密钥策略：
 

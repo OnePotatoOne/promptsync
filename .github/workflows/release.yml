@@ -16,7 +16,29 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       secret: ${{ steps.secret.outputs.secret }}
+      version: ${{ steps.version.outputs.version }}
     steps:
+      - uses: actions/checkout@v4
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          if [[ -z "$cargo_version" ]]; then
+            echo "could not read version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            if [[ "$version" != "$cargo_version" ]]; then
+              echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version" >&2
+              exit 1
+            fi
+          else
+            version="$cargo_version"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Derive cluster secret
         id: secret
         env:
@@ -37,7 +59,7 @@ jobs:
           printf 'secret=%s\n' "$secret" >> "$GITHUB_OUTPUT"
 
   build:
-    name: ${{ matrix.name }}
+    name: ${{ matrix.platform }}
     needs: prepare
     strategy:
       fail-fast: false
@@ -45,28 +67,29 @@ jobs:
         include:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            name: promptsync-linux-x86_64
+            platform: linux-x86_64
             ext: ""
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            name: promptsync-linux-aarch64
+            platform: linux-aarch64
             ext: ""
           # macOS 14 runners were retired on 2026-11-02; use macOS 15.
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            name: promptsync-macos-x86_64
+            platform: macos-x86_64
             ext: ""
           - os: macos-15
             target: aarch64-apple-darwin
-            name: promptsync-macos-aarch64
+            platform: macos-aarch64
             ext: ""
           - os: windows-2022
             target: x86_64-pc-windows-msvc
-            name: promptsync-windows-x86_64
+            platform: windows-x86_64
             ext: ".exe"
     runs-on: ${{ matrix.os }}
     env:
       PROMPTSYNC_BUILD_SECRET: ${{ needs.prepare.outputs.secret }}
+      VERSION: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -84,20 +107,22 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/promptsync" "dist/${{ matrix.name }}"
-          chmod +x "dist/${{ matrix.name }}"
+          asset="promptsync-${VERSION}-${{ matrix.platform }}"
+          cp "target/${{ matrix.target }}/release/promptsync" "dist/$asset"
+          chmod +x "dist/$asset"
       - name: Stage binary (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/promptsync.exe" "dist/${{ matrix.name }}.exe"
+          $asset = "promptsync-${env:VERSION}-${{ matrix.platform }}.exe"
+          Copy-Item "target/${{ matrix.target }}/release/promptsync.exe" "dist/$asset"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
-          path: dist/${{ matrix.name }}${{ matrix.ext }}
+          name: promptsync-${{ needs.prepare.outputs.version }}-${{ matrix.platform }}
+          path: dist/promptsync-${{ needs.prepare.outputs.version }}-${{ matrix.platform }}${{ matrix.ext }}
           if-no-files-found: error
 
   publish:
