@@ -594,23 +594,6 @@ fn finish_feishu(
     }
 
     println!();
-    // An agent only needs the owner open_id to send alerts. Asking for it here
-    // also supports send-only apps that cannot discover the private chat.
-    if role == Role::Agent && config.feishu.app.owner_open_id.trim().is_empty() {
-        let owner = prompter.text(
-            "告警接收者 open_id（留空则扫码绑定；服务端 status --json 可查）",
-            "",
-        );
-        if !owner.trim().is_empty() {
-            apply(
-                paths,
-                Some("feishu.app"),
-                "owner_open_id",
-                &toml_string(owner.trim()),
-            )?;
-            config.feishu.app.owner_open_id = owner.trim().to_string();
-        }
-    }
     let purpose = match role {
         Role::Server => feishu_control::BindingPurpose::Server,
         Role::Agent => feishu_control::BindingPurpose::Agent,
@@ -630,7 +613,10 @@ fn finish_feishu(
                 println!("飞书还没完成绑定；服务启动后会自动等待你发来第一条私聊消息。")
             }
             Role::Agent => {
-                println!("飞书还没完成绑定；离线告警暂不会发送，重新运行 agent 可再配置。")
+                println!("飞书还没完成绑定；离线告警暂不会发送。");
+                println!(
+                    "如果应用只有 im:message:send_as_bot 权限，请在 config.toml 的 [feishu.app] 手动填写 owner_open_id（服务端 status --json 可查）。"
+                );
             }
         },
         Err(err) => match role {

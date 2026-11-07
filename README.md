@@ -313,7 +313,7 @@ promptsync feishu-test                    # 给绑定的账号发一条测试消
 promptsync feishu-test --text "自定义内容"
 ```
 
-> agent 只发告警、不读消息，所以它的配置里只需要 `[feishu.app]` 的 `app_id`、`app_secret`、`owner_open_id` 三项，并保持 `[feishu] enabled = true`。运行 `promptsync agent` 的飞书步骤可以一键创建并自动绑定；也可以手动粘贴应用凭据，`owner_open_id` 可在服务端用 `promptsync status --json` 查到。
+> agent 只发告警、不读消息，所以它的配置里只需要 `[feishu.app]` 的 `app_id`、`app_secret`、`owner_open_id` 三项，并保持 `[feishu] enabled = true`。运行 `promptsync agent` 的飞书步骤可以一键创建并自动绑定，也可以手动粘贴应用凭据后走同样的扫码绑定，向导不会单独追问 `owner_open_id`。只有“只发消息”的应用绑不上时，才需要在 `config.toml` 的 `[feishu.app]` 手动填写 `owner_open_id`（可在服务端用 `promptsync status --json` 查到）。
 >
 > **权限取舍**：飞书应用的权限是应用级的。agent 要自己发离线告警，就需要在自己的机器上配置同一个 `app_id`/`app_secret`（也就意味着那台机器上的凭据具备应用的全部权限）。如果你介意，可以：给 agent 单独创建一个"只发消息"的应用（`im:message:send_as_bot` 即可，不授予只读权限），在 agent 的配置里填那套凭据；服务端仍用完整的应用。两套凭据互不影响。
 
