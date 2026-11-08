@@ -30,7 +30,7 @@ use promptsync::{agent, feishu, server};
         when it is empty."
 )]
 struct Cli {
-    /// Personal configuration directory (default: ./config)
+    /// Personal configuration directory (default: ./config, or an existing ~/.promptsync)
     #[arg(long, global = true, value_name = "DIR")]
     config_dir: Option<PathBuf>,
     /// Explicit config file (overrides the file inside --config-dir)
@@ -42,6 +42,9 @@ struct Cli {
     /// Never ask questions (services, scripts, cron)
     #[arg(long, global = true)]
     non_interactive: bool,
+    /// Re-run the configuration wizard even when a config already exists
+    #[arg(long, global = true)]
+    configure: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -129,6 +132,18 @@ async fn dispatch(cli: Cli) -> Result<u8> {
     if let Command::Init { force } = &cli.command {
         return init(&paths, *force);
     }
+    // Inspecting state must not create a config directory (and a fresh cluster
+    // secret) in whatever directory the command happened to run from.
+    let needs_existing_config = matches!(
+        cli.command,
+        Command::Status { .. } | Command::Ports | Command::ConfigFile | Command::FeishuTest { .. }
+    );
+    if needs_existing_config && !paths.config_file.exists() {
+        bail!(
+            "no config file at {}; run `promptsync server` or `promptsync agent` first, or pass --config-dir",
+            paths.config_file.display()
+        );
+    }
     let (mut config, created) = paths.load()?;
 
     // First start (or an old config created before this feature) gets a random
@@ -152,7 +167,12 @@ async fn dispatch(cli: Cli) -> Result<u8> {
         Command::Agent { server, port, once } => server.is_some() || port.is_some() || *once,
         _ => true,
     };
-    let prompter = Prompter::new(!cli.non_interactive && !explicit_override);
+    // `--configure` must still reach the wizard even when a --port/--bind
+    // override would otherwise make the run look scripted.
+    let prompter = Prompter::new(!cli.non_interactive && (!explicit_override || cli.configure));
+    if cli.configure && !prompter.enabled() && !cli.non_interactive {
+        eprintln!("[promptsync] 当前不是交互终端，--configure 被忽略；请在终端里运行。");
+    }
 
     match &cli.command {
         Command::Server { bind, port } => {
@@ -167,11 +187,14 @@ async fn dispatch(cli: Cli) -> Result<u8> {
             match interactive::prepare(
                 &paths,
                 config,
-                created,
                 Role::Server,
                 &prompter,
                 &logger,
-                secret_generated,
+                interactive::PrepareOptions {
+                    created,
+                    secret_generated,
+                    force_wizard: cli.configure,
+                },
             )? {
                 Some(prepared) => config = prepared,
                 None => {
@@ -209,11 +232,14 @@ async fn dispatch(cli: Cli) -> Result<u8> {
             match interactive::prepare(
                 &paths,
                 config,
-                created,
                 Role::Agent,
                 &prompter,
                 &logger,
-                secret_generated,
+                interactive::PrepareOptions {
+                    created,
+                    secret_generated,
+                    force_wizard: cli.configure,
+                },
             )? {
                 Some(prepared) => config = prepared,
                 None => {
@@ -360,7 +386,11 @@ fn init(paths: &Paths, force: bool) -> Result<u8> {
     println!("  1. on the server:  promptsync server");
     println!("  2. on each agent:  set agent.server in the config, then promptsync agent");
     println!(
-        "  3. copy the cluster secret above to every other machine (wizard step 3 / `promptsync secret --set <secret>`)."
+        "  3. copy the cluster secret above to every other machine (the wizard's secret step / `promptsync secret --set <secret>`)."
+    );
+    println!(
+        "  4. change settings later: edit {} or run `promptsync <server|agent> --configure`.",
+        paths.config_file.display()
     );
     Ok(0)
 }
@@ -457,6 +487,8 @@ fn status(config: &Config, paths: &Paths, json: bool) -> Result<u8> {
     let bytes = total_bytes(&entries);
     let data_dir = paths.data_dir();
     let log_dir = paths.log_dir(config);
+    let binding = promptsync::feishu_control::load_binding(&data_dir)
+        .filter(|binding| binding.app_id == config.feishu.app.app_id.trim());
     let state = agent::AgentState::load(&data_dir);
     let managed = std::fs::read_to_string(data_dir.join("managed.json"))
         .ok()
@@ -498,6 +530,7 @@ fn status(config: &Config, paths: &Paths, json: bool) -> Result<u8> {
                 "app_configured": config.feishu_app_configured(),
                 "bound": config.feishu_bound(),
                 "owner_open_id": config.feishu.app.owner_open_id,
+                "chat_id": binding.as_ref().map(|binding| binding.chat_id.clone()).unwrap_or_default(),
                 "target": config.sync.target,
                 "dry_run": config.feishu.control.dry_run,
             },
@@ -574,6 +607,19 @@ fn status(config: &Config, paths: &Paths, json: bool) -> Result<u8> {
             config.sync.target.trim()
         }
     );
+    if let Some(binding) = binding.as_ref() {
+        println!(
+            "feishu chat      {} -> {}（私聊发纯文本即可覆盖）",
+            binding.chat_id,
+            if config.sync.target.trim().is_empty() {
+                "-"
+            } else {
+                config.sync.target.trim()
+            }
+        );
+    } else if config.feishu.enabled && config.feishu_app_configured() {
+        println!("feishu chat      -（未绑定：启动 server 后按日志里的绑定码绑定）");
+    }
     println!("sources:");
     for source in &sources {
         println!(

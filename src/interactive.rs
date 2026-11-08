@@ -6,6 +6,7 @@
 //! inside the wizard - there is no separate binding command.
 
 use anyhow::Result;
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
@@ -146,24 +147,40 @@ pub fn parse_choice(value: &str, count: usize) -> Option<usize> {
     }
 }
 
+/// First-run state passed into [`prepare`].
+#[derive(Debug, Clone, Copy)]
+pub struct PrepareOptions {
+    /// The config file was created from the template on this start.
+    pub created: bool,
+    /// A fresh cluster secret was generated and has not been shown yet.
+    pub secret_generated: bool,
+    /// `--configure`: run the wizard even when the config already exists.
+    pub force_wizard: bool,
+}
+
 /// Entry point used by `server` and `agent`.
 ///
 /// * non-interactive: print a one-line hint when the config was just created.
-/// * existing config: ask once whether to start with it.
-/// * otherwise: run the stepped wizard, then a summary confirmation.
+/// * existing config and no `--configure`: start immediately and print a short
+///   summary. The common path must not cost a keypress.
+/// * otherwise: run the stepped wizard once, then print the summary and start.
 pub fn prepare(
     paths: &Paths,
     config: Config,
-    created: bool,
     role: Role,
     prompter: &Prompter,
     logger: &Logger,
-    secret_generated: bool,
+    options: PrepareOptions,
 ) -> Result<Option<Config>> {
+    let PrepareOptions {
+        created,
+        secret_generated,
+        force_wizard,
+    } = options;
     if !prompter.enabled() {
         if created {
             eprintln!(
-                "[promptsync] 已从模板创建 {}。请按需修改后启动；非交互环境不会进入配置向导。",
+                "[promptsync] 已创建 {}；集群密钥已生成，用 `promptsync secret --show` 查看。非交互环境不进入向导，要改配置就编辑该文件或加 `--configure`。",
                 paths.config_file.display()
             );
         }
@@ -171,35 +188,77 @@ pub fn prepare(
     }
 
     let mut config = config;
-    if !created {
-        println!("\n检测到已有配置：{}", paths.config_file.display());
-        if prompter.confirm("直接使用它启动？", true) {
-            return Ok(Some(config));
-        }
-        println!("进入配置向导，回车保留当前值。");
-    } else {
+    if !created && !force_wizard {
+        print_startup_summary(&config, paths, role);
+        return Ok(Some(config));
+    }
+    if created {
         println!("首次启动：回车使用推荐值。");
+    } else {
+        println!("进入配置向导，回车保留当前值。");
     }
 
+    // The summary at the end is not a numbered step: every step already
+    // persisted its value, so there is nothing left to confirm.
     let total = match role {
-        Role::Server => 5,
-        Role::Agent => 4,
+        Role::Server => 4,
+        Role::Agent => 3,
     };
-    loop {
-        match role {
-            Role::Server => server_wizard(&mut config, paths, prompter, logger, total, created)?,
-            Role::Agent => agent_wizard(&mut config, paths, prompter, logger, total, created)?,
-        }
-        let (reloaded, _) = paths.load()?;
-        config = reloaded;
-        print_summary(&config, paths, role, secret_generated);
-        if prompter.confirm("保存并启动？", true) {
-            return Ok(Some(config));
-        }
-        if !prompter.confirm("重新配置一遍？", true) {
-            return Ok(None);
-        }
+    match role {
+        Role::Server => server_wizard(&mut config, paths, prompter, logger, total, created)?,
+        Role::Agent => agent_wizard(&mut config, paths, prompter, logger, total, created)?,
     }
+    let (reloaded, _) = paths.load()?;
+    config = reloaded;
+    print_summary(&config, paths, role, secret_generated);
+    Ok(Some(config))
+}
+
+/// One-line Feishu state for the startup summary.
+fn feishu_state_text(config: &Config) -> String {
+    if !config.feishu.enabled {
+        return "未启用".to_string();
+    }
+    if !config.feishu_app_configured() {
+        return "已启用，缺少 app_id / app_secret".to_string();
+    }
+    let owner = config.feishu.app.owner_open_id.trim();
+    if owner.is_empty() {
+        "已启用，接收人启动后自动绑定/继承".to_string()
+    } else {
+        format!("已启用，接收人 {}", mask_id(owner))
+    }
+}
+
+/// Short summary shown when an existing config is used as-is.
+fn print_startup_summary(config: &Config, paths: &Paths, role: Role) {
+    println!("\n──── 配置已就绪 ────");
+    println!("配置文件     {}", paths.config_file.display());
+    match role {
+        Role::Server => println!(
+            "受管文件     {}",
+            if config.sync.target.trim().is_empty() {
+                "启动时自动识别".to_string()
+            } else {
+                config.sync.target.trim().to_string()
+            }
+        ),
+        Role::Agent => println!(
+            "服务端       {}:{}",
+            config.agent.server,
+            if config.agent.port == 0 {
+                "自动端口".to_string()
+            } else {
+                config.agent.port.to_string()
+            }
+        ),
+    }
+    println!("飞书         {}", feishu_state_text(config));
+    println!(
+        "要改配置     编辑上面的文件，或重新运行 `promptsync {} --configure`",
+        role.label()
+    );
+    println!();
 }
 
 fn server_wizard(
@@ -234,8 +293,6 @@ fn server_wizard(
         first_run || config.feishu.enabled,
         Role::Server,
     )?;
-
-    prompter.step(5, total, "确认");
     Ok(())
 }
 
@@ -267,8 +324,6 @@ fn agent_wizard(
         first_run || config.feishu.enabled,
         Role::Agent,
     )?;
-
-    prompter.step(4, total, "确认");
     Ok(())
 }
 
@@ -290,6 +345,9 @@ fn configure_target(config: &mut Config, paths: &Paths, prompter: &Prompter) -> 
     let candidates = feishu_control::target_candidates(config)?;
     if candidates.is_empty() {
         println!("没有在同步源里找到 system_prompt.md / SOUL.md。");
+        if offer_starter_target(config, paths, prompter)? {
+            return Ok(());
+        }
         let manual = prompter.text(
             "手动输入 sync.target（<source id>/<相对路径>，留空跳过）",
             config.sync.target.trim(),
@@ -297,7 +355,7 @@ fn configure_target(config: &mut Config, paths: &Paths, prompter: &Prompter) -> 
         if manual.trim().is_empty() {
             println!("已跳过：稍后可以在配置里设置 sync.target。");
         } else {
-            feishu_control::set_target(config, paths, manual.trim(), false)?;
+            feishu_control::set_target(config, &paths.config_file, manual.trim(), false)?;
             println!("已设置 sync.target = {}", config.sync.target);
         }
         return Ok(());
@@ -345,14 +403,45 @@ fn configure_target(config: &mut Config, paths: &Paths, prompter: &Prompter) -> 
         )
     };
     let key = candidates[chosen_index].key.clone();
-    let narrow = if candidates.len() > 1 || current != key {
-        prompter.confirm("以后只同步这一个文件？（其它文件停止管理，不删除）", true)
-    } else {
-        true
-    };
-    feishu_control::set_target(config, paths, &key, narrow)?;
-    println!("已设置为唯一受管文件：{key}");
+    // One managed file is the product default: the control channel always
+    // overwrites exactly this file. Narrowing the globs keeps the bundle small
+    // and is what the old confirmation offered by default, so do it silently.
+    feishu_control::set_target(config, &paths.config_file, &key, true)?;
+    println!("已设置为唯一受管文件：{key}（其它文件停止管理，不删除）");
     Ok(())
+}
+
+/// When no prompt file exists yet, offer a working default instead of asking
+/// the user to type a `<source id>/<path>` key. One Enter is enough to end up
+/// with a usable, synced file.
+fn offer_starter_target(config: &mut Config, paths: &Paths, prompter: &Prompter) -> Result<bool> {
+    let Some(source) = config
+        .sync
+        .sources
+        .iter()
+        .find(|source| source.id == "shared")
+        .cloned()
+    else {
+        return Ok(false);
+    };
+    let root = crate::util::expand_tilde(&source.root);
+    let path = root.join("prompt.md");
+    if !prompter.confirm(
+        &format!("创建一个新的受管 prompt（{}）？", path.display()),
+        true,
+    ) {
+        return Ok(false);
+    }
+    fs::create_dir_all(&root)?;
+    if !path.exists() {
+        fs::write(
+            &path,
+            "# 系统提示词\n\n在这里写内容；之后也可以直接给飞书机器人发纯文本覆盖这个文件。\n",
+        )?;
+    }
+    feishu_control::set_target(config, &paths.config_file, "shared/prompt.md", true)?;
+    println!("已创建受管文件：{}", path.display());
+    Ok(true)
 }
 
 fn configure_secret(config: &mut Config, paths: &Paths, prompter: &Prompter) -> Result<()> {
@@ -598,32 +687,51 @@ fn finish_feishu(
     }
 
     println!();
+    // Enabling the server's control channel requires a managed file. Fill it in
+    // here so the wizard never produces a config that silently disables Feishu.
+    if role == Role::Server && config.sync.target.trim().is_empty() {
+        match feishu_control::ensure_target(config, &paths.config_file, logger, false) {
+            Ok(Some(key)) => println!("已自动选定受管文件：{key}"),
+            Ok(None) => println!(
+                "警告：还没有受管文件（sync.target），飞书控制通道不会启动；请设置 [sync] target 或重新运行向导第 2 步。"
+            ),
+            Err(err) => println!("自动识别 sync.target 失败：{err:#}"),
+        }
+    }
     // Some tenants do not return p2p chats through the chat-list API, and
     // send-only apps cannot read messages at all. A configured recipient works
     // in both cases, so offer direct binding before trying QR discovery.
     if config.feishu.app.owner_open_id.trim().is_empty() {
-        let label = match role {
-            Role::Server => "授权账号 open_id（直接绑定最可靠；留空则尝试一次性绑定码）",
-            Role::Agent => "告警接收者 open_id（服务端 status --json 可查；留空则跳过离线告警）",
-        };
-        let owner = prompter.text(label, "");
-        if owner.trim().is_empty() {
-            if role == Role::Agent {
-                println!(
-                    "不填也可以：启动后日志会打印一次性绑定码，用授权账号在机器人私聊里发送即可；agent 会持续等待绑定，不需要手动粘贴 open_id。"
-                );
-                return Ok(());
-            }
-            println!("部分租户不会返回机器人私聊；若绑定码无响应，请重新运行并填写 open_id。");
+        if role == Role::Agent {
+            // The agent inherits the server's recipient from the manifest when
+            // both use the same app; otherwise the runtime binding loop takes
+            // over. Asking for an open_id here only added a prompt.
+            println!(
+                "告警接收人：同一个 app 时从服务端自动继承；app 不同时启动后按日志里的绑定码绑定，无需填写。"
+            );
         } else {
-            apply(
-                paths,
-                Some("feishu.app"),
-                "owner_open_id",
-                &toml_string(owner.trim()),
-            )?;
-            config.feishu.app.owner_open_id = owner.trim().to_string();
+            let owner = prompter.text(
+                "授权账号 open_id（一键创建会自动带；留空则启动后用一次性绑定码）",
+                "",
+            );
+            if owner.trim().is_empty() {
+                println!("部分租户不会返回机器人私聊；绑定码无响应时可重新运行并填写 open_id。");
+            } else {
+                apply(
+                    paths,
+                    Some("feishu.app"),
+                    "owner_open_id",
+                    &toml_string(owner.trim()),
+                )?;
+                config.feishu.app.owner_open_id = owner.trim().to_string();
+            }
         }
+    }
+    // The agent has no control channel: with no recipient configured it simply
+    // inherits the server's (same app) or binds from the background loop after
+    // startup. Waiting here for a one-time code would block the wizard.
+    if role == Role::Agent && config.feishu.app.owner_open_id.trim().is_empty() {
+        return Ok(());
     }
     let purpose = match role {
         Role::Server => feishu_control::BindingPurpose::Server,
@@ -752,29 +860,34 @@ fn print_summary(config: &Config, paths: &Paths, role: Role, show_secret: bool) 
         println!("同步源       {} 个", config.sync.sources.len());
     }
 
-    println!(
-        "客户端适配   {}{}",
-        if config.sync.adapt_clients {
-            "启用"
-        } else {
-            "关闭"
-        },
-        if adapters.is_empty() {
-            "（未检测到客户端）".to_string()
-        } else {
-            format!(
-                "，检测到 {} 个：{}",
-                adapters.len(),
-                adapters
-                    .iter()
-                    .map(|adapter| adapter.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        }
-    );
+    if role == Role::Server {
+        // Only the agent writes client files; the server just serves the bundle.
+        println!("客户端适配   由 agent 决定（server 不写本机客户端文件）");
+    } else {
+        println!(
+            "客户端适配   {}{}",
+            if config.sync.adapt_clients {
+                "启用"
+            } else {
+                "关闭"
+            },
+            if adapters.is_empty() {
+                "（未检测到客户端）".to_string()
+            } else {
+                format!(
+                    "，检测到 {} 个：{}",
+                    adapters.len(),
+                    adapters
+                        .iter()
+                        .map(|adapter| adapter.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        );
+    }
 
-    println!("飞书         {}", crate::feishu::describe(config));
+    println!("飞书         {}", feishu_state_text(config));
     if config.feishu.enabled {
         let app_id = config.feishu.app.app_id.trim();
         println!(
@@ -786,39 +899,60 @@ fn print_summary(config: &Config, paths: &Paths, role: Role, show_secret: bool) 
             }
         );
         let owner = config.feishu.app.owner_open_id.trim();
-        println!(
-            "告警接收人   {}",
-            if owner.is_empty() {
-                "未绑定".to_string()
-            } else {
-                mask_id(owner)
-            }
-        );
-        println!(
-            "飞书控制     target={} dry_run={}",
+        if role == Role::Server {
+            println!(
+                "告警接收人   {}",
+                if owner.is_empty() {
+                    "未绑定".to_string()
+                } else {
+                    mask_id(owner)
+                }
+            );
+            // The control channel only exists on the server; an agent has no
+            // sync.target of its own.
+            println!(
+                "飞书控制     target={} dry_run={}",
+                if config.sync.target.trim().is_empty() {
+                    "-"
+                } else {
+                    config.sync.target.trim()
+                },
+                config.feishu.control.dry_run
+            );
             if config.sync.target.trim().is_empty() {
-                "-"
-            } else {
-                config.sync.target.trim()
-            },
-            config.feishu.control.dry_run
-        );
+                println!("             ⚠ 未设置 sync.target：飞书控制通道不会启动");
+            }
+        } else {
+            println!(
+                "告警接收人   {}",
+                if owner.is_empty() {
+                    "启动后自动继承/绑定".to_string()
+                } else {
+                    mask_id(owner)
+                }
+            );
+        }
     }
 
     println!();
     match role {
         Role::Server => {
-            println!("下一步       其他机器首次启动时，在第 3 步粘贴上面的集群密钥；");
+            println!("下一步       其他机器首次启动时，在集群密钥步骤粘贴上面的集群密钥；");
             println!("             或运行 promptsync secret --set \"<这串密钥>\"。");
         }
         Role::Agent => {
             println!("下一步       确认上面的密钥指纹与 server 一致；不一致就重新运行");
-            println!("             promptsync agent，在第 3 步粘贴 server 的集群密钥。");
+            println!("             promptsync agent，在集群密钥步骤粘贴 server 的密钥。");
         }
     }
     if !show_secret {
         println!("             查看完整密钥：promptsync secret --show");
     }
+    println!(
+        "改配置       编辑 {}，或重新运行 `promptsync {} --configure`",
+        paths.config_file.display(),
+        role.label()
+    );
     println!();
 }
 

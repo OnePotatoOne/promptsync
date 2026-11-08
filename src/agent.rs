@@ -681,6 +681,11 @@ pub async fn run(
         sources.len(),
         data_dir.display()
     ));
+    logger.info(format!(
+        "要改配置：编辑 {}，或运行 `promptsync agent --configure`（日志 {}）",
+        config_file.display(),
+        logger.path().display()
+    ));
 
     // A recipient may already be configured, or a previous binding may still
     // be valid even if config.toml has no owner_open_id. Reuse it before
@@ -777,6 +782,15 @@ pub async fn run(
                 state.last_cycle_unix = now_unix();
                 state.consecutive_failures += 1;
                 state.last_error = Some(format!("{err:#}"));
+                // A secret mismatch is indistinguishable from a firewall on the
+                // wire (the server stays silent), so surface the likely cause
+                // once instead of only repeating "no handshake answer".
+                if state.consecutive_failures == 2 {
+                    logger.warn(format!(
+                        "还没有握手应答：请确认本机与 server 的 cluster_secret 一致（本机指纹 {}，server 启动日志里有它的指纹）",
+                        secret.fingerprint()
+                    ));
+                }
                 if let Err(save_err) = state.save(&data_dir) {
                     logger.warn(format!("cannot persist agent state: {save_err:#}"));
                 }

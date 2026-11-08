@@ -61,11 +61,23 @@ impl Logger {
     ) -> Result<Self> {
         fs::create_dir_all(dir).with_context(|| format!("creating log dir {}", dir.display()))?;
         let path = dir.join(file_name);
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
             .open(&path)
             .with_context(|| format!("opening log file {}", path.display()))?;
+        // Logs may contain one-time Feishu binding codes: keep them private,
+        // even when the file already existed with a looser mode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
         let size = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(Self {
             inner: Arc::new(Inner {
@@ -146,7 +158,16 @@ impl Logger {
                 let _ = fs::rename(&source, &target);
             }
         }
-        if let Ok(new_file) = OpenOptions::new().create(true).append(true).open(path) {
+        if let Ok(new_file) = {
+            let mut options = OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(path)
+        } {
             *file = new_file;
         }
     }

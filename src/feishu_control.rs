@@ -4,9 +4,10 @@
 use anyhow::{bail, Context, Result};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::{set_source_globs, set_value, Config};
@@ -21,6 +22,25 @@ use crate::util::{atomic_write, now_unix, safe_relative_path, secure_join};
 pub const BINDING_FILE: &str = "feishu-binding.json";
 pub const CURSOR_FILE: &str = "feishu-cursor.json";
 const SEEN_IDS_LIMIT: usize = 200;
+/// A message that cannot be applied (disk full, read-only mount, ...) is
+/// retried on the next poll instead of being dropped. After this many failed
+/// attempts it is recorded anyway so one stuck message cannot block the chat
+/// forever.
+const MAX_DELIVERY_ATTEMPTS: u8 = 3;
+const MAX_TRACKED_FAILURES: usize = 256;
+
+/// The recipient used for offline alerts. Binding can happen after startup, so
+/// the server keeps this in memory and every alert re-reads it.
+pub type OwnerCell = Arc<Mutex<Option<String>>>;
+
+pub fn owner_cell(owner: &str) -> OwnerCell {
+    let trimmed = owner.trim();
+    Arc::new(Mutex::new(if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Binding {
@@ -38,6 +58,10 @@ struct Cursor {
     last_create_time_ms: u64,
     #[serde(default)]
     seen_ids: Vec<String>,
+    /// Failed delivery attempts per message id. Older cursor files simply
+    /// start with an empty map.
+    #[serde(default)]
+    failures: BTreeMap<String, u8>,
 }
 
 impl Cursor {
@@ -49,6 +73,7 @@ impl Cursor {
             .unwrap_or(Self {
                 last_create_time_ms: default_ms,
                 seen_ids: Vec::new(),
+                failures: BTreeMap::new(),
             })
     }
 
@@ -70,7 +95,23 @@ impl Cursor {
                 self.seen_ids.drain(0..excess);
             }
         }
+        self.failures.remove(id);
         self.last_create_time_ms = self.last_create_time_ms.max(create_time_ms);
+    }
+
+    /// Count one failed delivery attempt for `id` and return the new count.
+    fn note_failure(&mut self, id: &str) -> u8 {
+        if id.is_empty() {
+            return MAX_DELIVERY_ATTEMPTS;
+        }
+        if self.failures.len() >= MAX_TRACKED_FAILURES && !self.failures.contains_key(id) {
+            if let Some(first) = self.failures.keys().next().cloned() {
+                self.failures.remove(&first);
+            }
+        }
+        let attempts = self.failures.entry(id.to_string()).or_insert(0);
+        *attempts = attempts.saturating_add(1);
+        *attempts
     }
 }
 
@@ -87,7 +128,11 @@ pub struct TargetFile {
 pub fn resolve_target(config: &Config, sources: &[SourceSpec]) -> Result<TargetFile> {
     let target = config.sync.target.trim();
     if target.is_empty() {
-        bail!("sync.target is not configured (single-file mode)");
+        bail!(
+            "sync.target is not set; the Feishu control channel needs one managed file. \
+             Set [sync] target = \"<source id>/<relative path>\" in the config file \
+             (or run `promptsync server` in a terminal and use wizard step 2)"
+        );
     }
     let (id, rest) = target
         .split_once('/')
@@ -135,6 +180,29 @@ fn save_binding(data_dir: &Path, binding: &Binding) -> Result<()> {
     let serialized = serde_json::to_vec_pretty(binding)?;
     atomic_write(&data_dir.join(BINDING_FILE), &serialized, true)
         .context("writing feishu-binding.json")
+}
+
+/// Reject bindings that cannot drive the control channel. Feishu sometimes
+/// answers a send without a `chat_id`; storing that would make the poll loop
+/// query an empty container forever and the user would never know why.
+fn checked_binding(config: &Config, binding: Binding) -> Result<Binding> {
+    if binding.chat_id.trim().is_empty() {
+        bail!(
+            "Feishu accepted the message for {} but returned no chat_id; the prompt control channel needs the private chat id (check im:message:send_as_bot and that the app is published)",
+            binding.open_id
+        );
+    }
+    if binding.open_id.trim().is_empty() {
+        bail!("Feishu returned no open_id for the bound private chat");
+    }
+    if binding.app_id != config.feishu.app.app_id.trim() {
+        bail!(
+            "binding belongs to app {:?}, but the config uses {:?}",
+            binding.app_id,
+            config.feishu.app.app_id.trim()
+        );
+    }
+    Ok(binding)
 }
 
 /// What the binding is used for. The server reads the private chat as its prompt
@@ -225,12 +293,15 @@ pub fn ensure_binding(
         let sent = client
             .send_text_to_owner(&configured_owner, check_message)
             .context("sending the binding check message")?;
-        let binding = Binding {
-            chat_id: sent.chat_id,
-            open_id: configured_owner,
-            app_id: config.feishu.app.app_id.trim().to_string(),
-            bound_unix: now_unix(),
-        };
+        let binding = checked_binding(
+            config,
+            Binding {
+                chat_id: sent.chat_id,
+                open_id: configured_owner,
+                app_id: config.feishu.app.app_id.trim().to_string(),
+                bound_unix: now_unix(),
+            },
+        )?;
         save_binding(&data_dir, &binding)?;
         logger.info(format!(
             "Feishu bound via configured owner_open_id (chat {})",
@@ -274,6 +345,13 @@ pub fn ensure_binding(
     while Instant::now() < deadline {
         match discover_p2p_binding(&client, &challenge) {
             Ok(Some(binding)) => {
+                let binding = match checked_binding(config, binding) {
+                    Ok(binding) => binding,
+                    Err(err) => {
+                        logger.warn(format!("Feishu binding rejected: {err:#}"));
+                        continue;
+                    }
+                };
                 save_binding(&data_dir, &binding)?;
                 set_value(
                     &paths.config_file,
@@ -281,6 +359,9 @@ pub fn ensure_binding(
                     "owner_open_id",
                     &format!("\"{}\"", binding.open_id),
                 )?;
+                // Keep the in-memory copy in step with the file so callers can
+                // print what was just learned without re-reading the config.
+                config.feishu.app.owner_open_id = binding.open_id.clone();
                 let _ = client.send_text_to_chat(&binding.chat_id, success_message);
                 logger.info(format!(
                     "Feishu bound: chat {} owner {}",
@@ -333,12 +414,15 @@ pub fn ensure_binding(
     let sent = client
         .send_text_to_owner(&open_id, success_message)
         .context("sending the binding message")?;
-    let binding = Binding {
-        chat_id: sent.chat_id,
-        open_id: open_id.clone(),
-        app_id: config.feishu.app.app_id.trim().to_string(),
-        bound_unix: now_unix(),
-    };
+    let binding = checked_binding(
+        config,
+        Binding {
+            chat_id: sent.chat_id,
+            open_id: open_id.clone(),
+            app_id: config.feishu.app.app_id.trim().to_string(),
+            bound_unix: now_unix(),
+        },
+    )?;
     save_binding(&data_dir, &binding)?;
     set_value(
         &paths.config_file,
@@ -383,7 +467,7 @@ pub fn target_candidates(config: &Config) -> Result<Vec<TargetCandidate>> {
 }
 
 /// Persist `sync.target` and optionally narrow the source globs to that file.
-pub fn set_target(config: &mut Config, paths: &Paths, key: &str, narrow: bool) -> Result<()> {
+pub fn set_target(config: &mut Config, config_file: &Path, key: &str, narrow: bool) -> Result<()> {
     let previous = config.sync.target.clone();
     config.sync.target = key.to_string();
     if let Err(err) = || -> Result<()> {
@@ -394,17 +478,12 @@ pub fn set_target(config: &mut Config, paths: &Paths, key: &str, narrow: bool) -
         config.sync.target = previous;
         return Err(err);
     }
-    set_value(
-        &paths.config_file,
-        Some("sync"),
-        "target",
-        &format!("\"{key}\""),
-    )?;
+    set_value(config_file, Some("sync"), "target", &format!("\"{key}\""))?;
     if narrow {
         let (id, relative) = key
             .split_once('/')
             .context("sync.target has no source id")?;
-        set_source_globs(&paths.config_file, id, &[relative.to_string()])?;
+        set_source_globs(config_file, id, &[relative.to_string()])?;
         if let Some(source) = config
             .sync
             .sources
@@ -415,6 +494,54 @@ pub fn set_target(config: &mut Config, paths: &Paths, key: &str, narrow: bool) -
         }
     }
     Ok(())
+}
+
+/// Fill `sync.target` when it is empty and exactly one candidate exists.
+///
+/// The server also calls this before starting the control channel, so a
+/// non-interactive start (systemd/launchd/`--port ...`) still gets a managed
+/// file instead of silently running without the Feishu control channel.
+pub fn ensure_target(
+    config: &mut Config,
+    config_file: &Path,
+    logger: &Logger,
+    narrow: bool,
+) -> Result<Option<String>> {
+    if !config.sync.target.trim().is_empty() {
+        return Ok(Some(config.sync.target.trim().to_string()));
+    }
+    let candidates = target_candidates(config)?;
+    let non_empty: Vec<&TargetCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.bytes > 0)
+        .collect();
+    let chosen = if non_empty.len() == 1 {
+        Some(non_empty[0].key.clone())
+    } else if candidates.len() == 1 {
+        Some(candidates[0].key.clone())
+    } else {
+        None
+    };
+    let Some(key) = chosen else {
+        if candidates.is_empty() {
+            logger.warn(
+                "Feishu control needs sync.target, but no system_prompt.md / SOUL.md was found in the configured sources; set [sync] target = \"<source id>/<relative path>\" or run `promptsync server` in a terminal",
+            );
+        } else {
+            logger.warn(format!(
+                "Feishu control needs sync.target; several candidates exist: {}. Set [sync] target or run `promptsync server` in a terminal",
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.key.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        return Ok(None);
+    };
+    set_target(config, config_file, &key, narrow)?;
+    logger.info(format!("sync.target auto-detected: {key}"));
+    Ok(Some(key))
 }
 
 fn qr_art(link: &str) -> Option<String> {
@@ -474,12 +601,14 @@ fn discover_p2p_binding(
 }
 
 /// Ingest loop (runs on the server).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
     data_dir: PathBuf,
     config_file: PathBuf,
     target: TargetFile,
     binding: Option<Binding>,
+    owner: OwnerCell,
     logger: Logger,
 ) -> Result<()> {
     let client = Arc::new(FeishuClient::from_config(&config)?);
@@ -508,6 +637,9 @@ pub async fn run(
             .await?
         }
     };
+    // Binding may have happened after the server started; alerts must use the
+    // fresh recipient without waiting for a restart.
+    publish_owner(&owner, &binding.open_id);
     let poll = Duration::from_secs(poll_secs);
     let mut cursor = Cursor::load(&data_dir, (binding.bound_unix + 2) * 1000);
 
@@ -542,6 +674,97 @@ pub async fn run(
     }
 }
 
+/// Make the recipient known to the process that sends alerts.
+fn publish_owner(owner: &OwnerCell, open_id: &str) {
+    let open_id = open_id.trim();
+    if open_id.is_empty() {
+        return;
+    }
+    if let Ok(mut guard) = owner.lock() {
+        if guard.as_deref() != Some(open_id) {
+            *guard = Some(open_id.to_string());
+        }
+    }
+}
+
+/// Persist a binding in the state dir and write the recipient back to the
+/// config file (best effort: the binding file is authoritative at runtime).
+fn store_binding(data_dir: &Path, config_file: &Path, binding: &Binding) -> Result<()> {
+    save_binding(data_dir, binding)?;
+    let _ = set_value(
+        config_file,
+        Some("feishu.app"),
+        "owner_open_id",
+        &format!("\"{}\"", binding.open_id),
+    );
+    Ok(())
+}
+
+/// A configured Feishu email/mobile is the most reliable fallback when the
+/// tenant does not expose p2p chats: resolve it once, message the account and
+/// learn the chat id from the response.
+async fn try_contact_binding(
+    config: &Config,
+    client: &Arc<FeishuClient>,
+    logger: &Logger,
+    success_message: &str,
+) -> Option<Binding> {
+    let contact = config.feishu.control.bind_contact.trim().to_string();
+    if contact.is_empty() {
+        return None;
+    }
+    let config = config.clone();
+    let client = Arc::clone(client);
+    let message = success_message.to_string();
+    let label = contact.clone();
+    match tokio::task::spawn_blocking(move || {
+        bind_via_contact(&config, &client, &contact, &message)
+    })
+    .await
+    {
+        Ok(Ok(binding)) => Some(binding),
+        Ok(Err(err)) => {
+            logger.warn(format!(
+                "Feishu bind_contact {label:?} failed: {err:#}; falling back to the one-time code"
+            ));
+            None
+        }
+        Err(err) => {
+            logger.warn(format!("Feishu bind_contact task panicked: {err}"));
+            None
+        }
+    }
+}
+
+/// Resolve an open_id or a Feishu email/mobile, message the account and learn
+/// the private chat id from the send response.
+fn bind_via_contact(
+    config: &Config,
+    client: &FeishuClient,
+    contact: &str,
+    message: &str,
+) -> Result<Binding> {
+    let contact = contact.trim();
+    if contact.is_empty() {
+        bail!("feishu.control.bind_contact is empty");
+    }
+    let open_id = if contact.starts_with("ou_") {
+        contact.to_string()
+    } else {
+        client.lookup_open_id(contact)?
+    };
+    let sent = client.send_text_to_owner(&open_id, message)?;
+    checked_binding(
+        config,
+        Binding {
+            chat_id: sent.chat_id,
+            open_id,
+            app_id: config.feishu.app.app_id.trim().to_string(),
+            bound_unix: now_unix(),
+        },
+    )
+}
+
 /// Wait for the one-time binding code and persist the binding.
 ///
 /// Both roles use the same private-chat discovery: the server needs the chat
@@ -564,10 +787,22 @@ async fn bind_loop(
         BindingPurpose::Agent => "promptsync agent 绑定成功。之后离线告警会发到这个私聊。",
     };
     let mut challenge = BindingChallenge::new();
+    if let Some(binding) = try_contact_binding(config, client, logger, success_message).await {
+        store_binding(data_dir, config_file, &binding)?;
+        logger.info(format!(
+            "Feishu bound via bind_contact: chat {} owner {}",
+            binding.chat_id, binding.open_id
+        ));
+        return Ok(binding);
+    }
     logger.info(format!(
         "Feishu: 尚未绑定。请用需要授权的账号在机器人私聊中只发送一次性绑定码 {}（15 分钟内有效）；发送普通消息不会获得控制权",
         challenge.code
     ));
+    println!(
+        "\n[promptsync] 飞书未绑定：请用授权账号在机器人私聊里只发送一次性绑定码 {}\n",
+        challenge.code
+    );
     logger.warn(
         "如果发送绑定码后没有反应，说明当前租户可能不返回 p2p 私聊，或应用缺少 im:message:readonly / im:chat:readonly 权限；可改为在 config.toml 的 [feishu.app] 填写 owner_open_id",
     );
@@ -576,25 +811,32 @@ async fn bind_loop(
         if challenge.expired(now_unix()) {
             challenge = BindingChallenge::new();
             logger.info(format!("Feishu 绑定码已更新：{}", challenge.code));
+            println!("\n[promptsync] 新的飞书一次性绑定码：{}\n", challenge.code);
         }
-        let config = config.clone();
+        let task_config = config.clone();
         let client_for_task = Arc::clone(client);
         let attempt = {
             let challenge = challenge.clone();
             tokio::task::spawn_blocking(move || {
-                try_bind_once(&config, &client_for_task, &challenge)
+                try_bind_once(&task_config, &client_for_task, &challenge)
             })
             .await
         };
         match attempt {
             Ok(Ok(Some(binding))) => {
-                save_binding(data_dir, &binding)?;
-                let _ = set_value(
-                    config_file,
-                    Some("feishu.app"),
-                    "owner_open_id",
-                    &format!("\"{}\"", binding.open_id),
-                );
+                let binding = match checked_binding(config, binding) {
+                    Ok(binding) => binding,
+                    Err(err) => {
+                        let message = format!("{err:#}");
+                        if last_error.as_deref() != Some(&message) {
+                            logger.warn(format!("Feishu binding rejected: {message}"));
+                            last_error = Some(message);
+                        }
+                        tokio::time::sleep(Duration::from_secs(poll_secs)).await;
+                        continue;
+                    }
+                };
+                store_binding(data_dir, config_file, &binding)?;
                 let _ = client.send_text_to_chat(&binding.chat_id, success_message);
                 logger.info(format!(
                     "Feishu bound: chat {} owner {}",
@@ -655,12 +897,15 @@ fn try_bind_once(
             owner,
             "promptsync 已就绪，之后直接在这个私聊里发纯文本即可。",
         )?;
-        return Ok(Some(Binding {
-            chat_id: sent.chat_id,
-            open_id: owner.to_string(),
-            app_id: config.feishu.app.app_id.trim().to_string(),
-            bound_unix: now_unix(),
-        }));
+        return Ok(Some(checked_binding(
+            config,
+            Binding {
+                chat_id: sent.chat_id,
+                open_id: owner.to_string(),
+                app_id: config.feishu.app.app_id.trim().to_string(),
+                bound_unix: now_unix(),
+            },
+        )?));
     }
     discover_p2p_binding(client, challenge)
 }
@@ -706,6 +951,11 @@ fn poll_once(
             Ok(Applied::Ignored { reason }) => {
                 cursor.record(&message.id, message.create_time_ms);
                 reason
+            }
+            Ok(Applied::Rejected { reason }) => {
+                cursor.record(&message.id, message.create_time_ms);
+                log_message = Some(format!("Feishu update rejected: {reason}"));
+                Some(format!("❌ 未更新：{reason}"))
             }
             Ok(Applied::Written {
                 bytes,
@@ -759,10 +1009,30 @@ fn poll_once(
                     &hash[..8.min(hash.len())]
                 ))
             }
+            // Do not advance past a message we could not deliver: a transient
+            // write failure must not silently drop the prompt. Retry on the
+            // next poll and give up only after MAX_DELIVERY_ATTEMPTS.
             Err(err) => {
-                cursor.record(&message.id, message.create_time_ms);
-                log_message = Some(format!("Feishu update rejected: {err:#}"));
-                Some(format!("❌ 未更新：{err:#}"))
+                let attempt = cursor.note_failure(&message.id);
+                let detail = format!("{err:#}");
+                if attempt >= MAX_DELIVERY_ATTEMPTS {
+                    cursor.record(&message.id, message.create_time_ms);
+                    log_message = Some(format!(
+                        "Feishu update failed after {attempt} attempts: {detail}"
+                    ));
+                    Some(format!(
+                        "❌ 未更新（已重试 {MAX_DELIVERY_ATTEMPTS} 次）：{detail}"
+                    ))
+                } else {
+                    log_message = Some(format!(
+                        "Feishu update failed (attempt {attempt}/{MAX_DELIVERY_ATTEMPTS}), will retry: {detail}"
+                    ));
+                    if attempt == 1 {
+                        Some(format!("❌ 未更新：{detail}；稍后自动重试"))
+                    } else {
+                        None
+                    }
+                }
             }
         };
         if let Some(reply) = reply {
@@ -781,6 +1051,11 @@ fn poll_once(
 enum Applied {
     Ignored {
         reason: Option<String>,
+    },
+    /// The message was understood but refused (too large / unsupported). It is
+    /// deliberately not retried.
+    Rejected {
+        reason: String,
     },
     Written {
         bytes: usize,
@@ -816,11 +1091,13 @@ fn apply_message(
         });
     }
     if text.len() > config.feishu.control.max_message_bytes {
-        bail!(
-            "内容 {} B 超过上限 {} B",
-            text.len(),
-            config.feishu.control.max_message_bytes
-        );
+        return Ok(Applied::Rejected {
+            reason: format!(
+                "内容 {} B 超过上限 {} B",
+                text.len(),
+                config.feishu.control.max_message_bytes
+            ),
+        });
     }
     // The message ends up on disk exactly as written; make sure the newline at
     // the very end is normalised so repeated messages do not churn the hash.
@@ -960,6 +1237,9 @@ mod tests {
                         ("GET", "/open-apis/im/v1/chats") => {
                             json!({ "code": 0, "data": { "items": *c.lock().unwrap(), "has_more": false } })
                         }
+                        ("POST", "/open-apis/contact/v3/users/batch_get_id") => {
+                            json!({ "code": 0, "data": { "user_list": [ { "user_id": "ou_owner" } ] } })
+                        }
                         _ => json!({ "code": 99999, "msg": "not mocked" }),
                     };
                     let response = Response::from_string(payload.to_string()).with_header(
@@ -1050,6 +1330,7 @@ mod tests {
         let cursor = Cursor {
             last_create_time_ms: now_unix() * 1000 - 5000,
             seen_ids: Vec::new(),
+            failures: BTreeMap::new(),
         };
         (config, temp, target, binding, cursor)
     }
@@ -1222,6 +1503,7 @@ mod tests {
         let mut cursor = Cursor {
             last_create_time_ms: 0,
             seen_ids: Vec::new(),
+            failures: BTreeMap::new(),
         };
         cursor.record("a", 10);
         cursor.record("a", 10);
@@ -1232,6 +1514,34 @@ mod tests {
             cursor.record(&format!("id{index}"), 100 + index);
         }
         assert_eq!(cursor.seen_ids.len(), SEEN_IDS_LIMIT);
+    }
+
+    #[test]
+    fn a_failed_write_is_retried_then_given_up() {
+        let mock = MockFeishu::start();
+        mock.push_text("cannot be written", "ou_owner");
+        let (config, _temp, target, binding, cursor) = fixture(&mock);
+        // Point the target at a directory: the atomic replace then fails like a
+        // full disk or a read-only mount.
+        fs::remove_file(&target.path).unwrap();
+        fs::create_dir_all(&target.path).unwrap();
+        let client = FeishuClient::new(&config.feishu.app, Duration::from_secs(5)).unwrap();
+
+        let first = poll_once(&config, &client, &binding, &target, &cursor).unwrap();
+        assert!(!first.cursor.seen("m-0"));
+        assert_eq!(first.cursor.failures.get("m-0").copied(), Some(1));
+        assert!(first.log_message.as_deref().unwrap().contains("will retry"));
+
+        let second = poll_once(&config, &client, &binding, &target, &first.cursor).unwrap();
+        assert!(!second.cursor.seen("m-0"));
+        let third = poll_once(&config, &client, &binding, &target, &second.cursor).unwrap();
+        assert!(third.cursor.seen("m-0"));
+        assert_eq!(third.cursor.failures.get("m-0"), None);
+
+        let acks = mock.acks();
+        assert!(acks[0].contains("稍后自动重试"));
+        assert!(acks.last().unwrap().contains("已重试 3 次"));
+        assert_eq!(acks.len(), 2);
     }
 
     #[test]
@@ -1302,7 +1612,7 @@ mod tests {
         fs::write(&paths.config_file, &text).unwrap();
         let mut config: Config = toml::from_str(&text).unwrap();
         let key = "cindy/acme/bots/cindy/SOUL.md";
-        set_target(&mut config, &paths, key, true).unwrap();
+        set_target(&mut config, &paths.config_file, key, true).unwrap();
         assert_eq!(config.sync.target, key);
         assert_eq!(
             config.sync.sources[0].globs,
@@ -1315,7 +1625,129 @@ mod tests {
             reloaded.sync.sources[0].globs,
             vec!["acme/bots/cindy/SOUL.md"]
         );
-        assert!(set_target(&mut config, &paths, "cindy/../escape.md", true).is_err());
+        assert!(set_target(&mut config, &paths.config_file, "cindy/../escape.md", true).is_err());
+    }
+
+    #[test]
+    fn ensure_target_fills_the_single_candidate_without_narrowing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("owners");
+        let dir = root.join("acme/bots/cindy");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SOUL.md"), "soul").unwrap();
+        let config_file = temp.path().join("config.toml");
+        let text = format!(
+            "[sync]\ntarget = \"\"\n[[sync.sources]]\nid = \"cindy\"\nroot = \"{}\"\nglobs = [\"*/bots/*/*.md\"]\n",
+            root.display()
+        );
+        fs::write(&config_file, &text).unwrap();
+        let mut config: Config = toml::from_str(&text).unwrap();
+        let logger = Logger::new(
+            &temp.path().join("logs"),
+            "test.log",
+            crate::logx::Level::Info,
+            65536,
+            1,
+            false,
+        )
+        .unwrap();
+
+        let chosen = ensure_target(&mut config, &config_file, &logger, false)
+            .unwrap()
+            .expect("auto-detected target");
+        assert_eq!(chosen, "cindy/acme/bots/cindy/SOUL.md");
+        assert_eq!(config.sync.target, chosen);
+        // Startup auto-detection must not narrow the source globs.
+        assert_eq!(config.sync.sources[0].globs, vec!["*/bots/*/*.md"]);
+        let reloaded: Config = toml::from_str(&fs::read_to_string(&config_file).unwrap()).unwrap();
+        assert_eq!(reloaded.sync.target, chosen);
+
+        // An existing target is left untouched.
+        assert_eq!(
+            ensure_target(&mut config, &config_file, &logger, false).unwrap(),
+            Some(chosen)
+        );
+    }
+
+    #[test]
+    fn ensure_target_does_not_guess_between_multiple_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("owners");
+        for bot in ["one", "two"] {
+            let dir = root.join(format!("acme/bots/{bot}"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("SOUL.md"), format!("soul {bot}")).unwrap();
+        }
+        let config_file = temp.path().join("config.toml");
+        let text = format!(
+            "[sync]\ntarget = \"\"\n[[sync.sources]]\nid = \"cindy\"\nroot = \"{}\"\nglobs = [\"*/bots/*/*.md\"]\n",
+            root.display()
+        );
+        fs::write(&config_file, &text).unwrap();
+        let mut config: Config = toml::from_str(&text).unwrap();
+        let logger = Logger::new(
+            &temp.path().join("logs"),
+            "test.log",
+            crate::logx::Level::Info,
+            65536,
+            1,
+            false,
+        )
+        .unwrap();
+        assert!(ensure_target(&mut config, &config_file, &logger, false)
+            .unwrap()
+            .is_none());
+        assert!(config.sync.target.is_empty());
+        let reloaded: Config = toml::from_str(&fs::read_to_string(&config_file).unwrap()).unwrap();
+        assert!(reloaded.sync.target.is_empty());
+    }
+
+    #[test]
+    fn bind_contact_resolves_an_email_and_binds() {
+        let mock = MockFeishu::start();
+        let mut config = Config::default();
+        config.feishu.enabled = true;
+        config.feishu.app.app_id = "cli_test".to_string();
+        config.feishu.app.app_secret = "secret".to_string();
+        config.feishu.app.api_base = mock.base.clone();
+        config.feishu.control.bind_contact = "owner@example.com".to_string();
+        let client = FeishuClient::new(&config.feishu.app, Duration::from_secs(5)).unwrap();
+        let binding = bind_via_contact(&config, &client, "owner@example.com", "hello").unwrap();
+        assert_eq!(binding.open_id, "ou_owner");
+        assert_eq!(binding.chat_id, "oc_p2p");
+        assert_eq!(binding.app_id, "cli_test");
+        assert!(mock.acks().iter().any(|text| text == "hello"));
+    }
+
+    #[test]
+    fn bindings_without_a_chat_id_are_rejected() {
+        let mut config = Config::default();
+        config.feishu.app.app_id = "cli_x".to_string();
+        let binding = Binding {
+            chat_id: "  ".to_string(),
+            open_id: "ou_x".to_string(),
+            app_id: "cli_x".to_string(),
+            bound_unix: 1,
+        };
+        let err = checked_binding(&config, binding).unwrap_err();
+        assert!(err.to_string().contains("no chat_id"));
+
+        let binding = Binding {
+            chat_id: "oc_x".to_string(),
+            open_id: "ou_x".to_string(),
+            app_id: "cli_other".to_string(),
+            bound_unix: 1,
+        };
+        assert!(checked_binding(&config, binding).is_err());
+    }
+
+    #[test]
+    fn owner_cell_publishes_the_bound_recipient() {
+        let cell = owner_cell("");
+        publish_owner(&cell, "ou_new");
+        assert_eq!(cell.lock().unwrap().as_deref(), Some("ou_new"));
+        publish_owner(&cell, "  ");
+        assert_eq!(cell.lock().unwrap().as_deref(), Some("ou_new"));
     }
 
     #[test]

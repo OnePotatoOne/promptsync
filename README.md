@@ -12,7 +12,7 @@
 - 绑定后可以直接给机器人**私聊发纯文本**，服务端自动覆盖唯一那个 prompt 文件，agent 再自动同步。
 - agent 拉取后**自动适配本机客户端**：Codex、Claude Code、Kimi、DeepSeek、Cindy 的全局指令文件一起更新，覆盖前自动备份。
 - **首次启动自动生成随机集群密钥**并写入本机配置（同时打印一次）；仓库和发布产物里没有固定密钥。其他机器用同一串密钥或同一句口令对齐。
-- **个人配置集中在一个目录**（默认 `./config`，空目录启动时自动从模板生成，整个目录被 git 忽略）。
+- **个人配置集中在一个目录**（默认 `./config`，空目录启动时自动从模板生成，整个目录被 git 忽略；当前目录还没有配置、而 `~/.promptsync/config.toml` 已存在时会直接复用它，避免换目录启动生成第二份密钥）。
 - 单文件 Rust 二进制，本地编译；GitHub Actions 交叉编译各平台裸二进制。
 
 > 这是「可信内网/自建服务器 + 自己的多台电脑」场景的工具，不是面向公网多租户的服务。安全边界见 [安全模型](#安全模型与边界)。
@@ -33,17 +33,17 @@ cargo build --release
 首次运行 `promptsync server` 或 `promptsync agent` 时，程序会：
 
 1. 生成 32 字节随机集群密钥并写回 `config.toml`（同时打印一次、给出配置文件路径）；
-2. 在配置向导第 3 步允许你直接回车保留它，或粘贴/输入其他机器使用的同一密钥/口令。
+2. 在向导的集群密钥步骤（server 第 3 步 / agent 第 2 步）直接回车保留它，或粘贴/输入其他机器使用的同一密钥/口令。
 
 飞书使用**自建应用**，`app_id`/`app_secret` 只保存在本机配置目录，**不会编进二进制**。
 
-> Release 里直接是**裸可执行文件**（没有 tar.gz / zip），文件名带版本号：Linux/macOS 为 `promptsync-<版本>-<平台>`（如 `promptsync-0.2.6-macos-aarch64`），Windows 为 `promptsync-<版本>-windows-x86_64.exe`。配置模板已经编译进二进制，首次启动自动生成，不需要额外的 README、模板或安装脚本。下载后 `chmod +x` 即可运行。
+> Release 里直接是**裸可执行文件**（没有 tar.gz / zip），文件名带版本号：Linux/macOS 为 `promptsync-<版本>-<平台>`（如 `promptsync-0.3.0-macos-aarch64`），Windows 为 `promptsync-<版本>-windows-x86_64.exe`。配置模板已经编译进二进制，首次启动自动生成，不需要额外的 README、模板或安装脚本。下载后 `chmod +x` 即可运行。
 
 Release 二进制本身不包含集群密钥；每台机器首次运行生成自己的密钥，复制 server 打印的那一串到 agent 即可。**不同机器默认互不信任**，这是刻意设计。
 
 ### 1.2 个人配置目录（默认 `./config`）
 
-所有个人配置都在**一个目录**里，默认是当前工作目录下的 `config/`：
+所有个人配置都在**一个目录**里，默认是当前工作目录下的 `config/`；如果当前目录还没有 `config.toml`、但 `~/.promptsync/config.toml` 已经存在，会自动复用后者（打印一行提示，可用 `--config-dir` 覆盖）：
 
 ```
 config/
@@ -54,7 +54,7 @@ config/
 
 规则：
 
-- 目录**默认为空**（仓库里不存在、也不会提交）。第一次运行 `server` / `agent` / `status` 时如果里面没有 `config.toml`，会按 `templates/config.toml` 模板生成一份，权限 0600。
+- 目录**默认为空**（仓库里不存在、也不会提交）。第一次运行 `server` / `agent` / `init` 时如果里面没有 `config.toml`，会按 `templates/config.toml` 模板生成一份，权限 0600；只读命令（`status` / `ports` / `config-file` / `feishu-test`）不会创建。
 - 之后启动**绝不覆盖**已有配置；要重新生成用 `promptsync init --force`（旧文件会先备份成 `config.toml.bak.<时间戳>`）。
 - 模板里的 `{home}`、`{cindy_root}`、`{config_dir}` 会在生成时替换成本机路径。
 - `config/` 已在 `.gitignore` 中，**不会被上传到 GitHub**；CI 还会检查是否有跟踪文件落在 `config/` 下，发现即失败。
@@ -66,24 +66,27 @@ PROMPTSYNC_CONFIG_DIR=~/psync-config promptsync status
 promptsync --config /etc/promptsync/config.toml status   # 直接指定文件（目录取父目录）
 ```
 
-> 因为默认目录是**相对当前工作目录**的 `./config`，用 systemd/launchd 长驻时请设置 `WorkingDirectory` 或直接传 `--config-dir <绝对路径>`（`packaging/install.sh` 会自动处理好）。
+> 默认目录仍是**相对当前工作目录**的 `./config`（只有在该目录没有配置时才回退到 `~/.promptsync`），所以用 systemd/launchd 长驻时请设置 `WorkingDirectory` 或直接传 `--config-dir <绝对路径>`（`packaging/install.sh` 会自动处理好）。
 
 ### 1.2.1 启动向导（server / agent）
 
-`server` 和 `agent` 在终端里启动时会走一个**逐步向导**：一次只问一项，直接回车保留推荐值，最后给你一份摘要让你确认。不再需要额外的绑定命令。
+`server` 和 `agent` 只在**首次启动**（或显式加 `--configure`）时进入向导：一次只问一项，直接回车保留推荐值；结束时打印一份"配了什么、去哪里改"的摘要并**直接启动**，不再要求确认。之后正常启动**一个问题都不问**。
 
-- **服务端首次启动（5 步）**
-  1. 监听地址与数据端口（0 = 由密钥自动推导）；
-  2. 要同步的 prompt 文件：自动列出候选（`system_prompt.md` / `SOUL.md`），多个时用序号选一个，并问"以后只同步这一个文件吗"；
+- **服务端首次启动（4 步，最少 3 次回车）**
+  1. 监听地址与数据端口（回车 = 0 自动推导）；
+  2. 受管 prompt 文件：只有一个非空候选时直接选中，并把该 source 的 globs 收窄到它，**不再额外确认**；一个候选都没有时可直接回车创建一个 `~/.promptsync/shared/prompt.md`；只有多个候选才需要选序号；
   3. 集群密钥：首次启动会自动生成随机密钥并打印一次（同时给出 `config.toml` 路径）；向导里只显示指纹，回车保留它，或粘贴/输入其他机器使用的同一密钥/口令；
-  4. 飞书：确认启用 → 默认「一键创建」，点开链接确认后自动填好 `app_id` / `app_secret` 和 owner，并当场完成绑定；已有应用可打开 `https://open.feishu.cn/app` 查看全部应用后手动粘贴；
-  5. 摘要确认：显示监听、受管文件、密钥、飞书状态，回车开始运行。
-- **agent 首次启动（4 步）**
-  1. 服务端地址与端口；2. 集群密钥（首次启动自动生成并打印，可粘贴 server 的密钥）；3. 飞书（一键创建会自动带接收人；手动粘贴应用时可填 `owner_open_id`，留空也可以：启动后日志会打印一次性绑定码，agent 会持续等待，不需要手动粘贴）；4. 摘要确认。
+  4. 飞书：确认启用 → 默认「一键创建」，点开链接确认后自动填好 `app_id` / `app_secret` 和 owner，并当场完成绑定；已有应用可打开 `https://open.feishu.cn/app` 查看全部应用后手动粘贴。一键创建时不需要填任何 open_id。
+- **agent 首次启动（3 步，最少 3 次回车）**
+  1. 服务端地址与端口；2. 集群密钥（首次启动自动生成并打印，可粘贴 server 的密钥）；3. 飞书：一键创建会自动带接收人；同 app 时**告警接收人从 server 自动继承，不再询问 open_id**；不同 app 或 server 尚未绑定时，启动后按日志里的绑定码绑定即可。
 - **首次启动的密钥**：server/agent 启动时若配置里没有密钥，会立即生成一个并打印完整 hex、指纹和配置文件路径；最后摘要还会再显示一次。以后用 `promptsync secret --show` 查看，或直接打开 `config.toml` 的 `cluster_secret`。
-- **后续启动**：只问一句"直接使用已有配置启动？[Y/n]"；选 `n` 就重新进入向导（所以改配置、重绑飞书都走同一个入口）。
+- **后续启动**：直接打印"配置已就绪"（配置文件、受管文件/服务端地址、飞书状态）并启动，**不再提问**。要改配置或重绑飞书：
+  ```bash
+  promptsync server --configure     # 或 promptsync agent --configure
+  ```
+  也可以直接编辑 `config/config.toml`，下次启动生效。
 - 每一步都会**立即写回** `config/config.toml`（保留注释），中途退出也不会丢已填的内容。
-- **不会打扰脚本和服务**：非 TTY、`--non-interactive`、或已用 `--server` / `--port` / `--bind` / `--once` 覆盖时，自动跳过向导。
+- **不会打扰脚本和服务**：非 TTY、`--non-interactive`、或已用 `--server` / `--port` / `--bind` / `--once` 覆盖时，自动跳过向导（加 `--configure` 可强制进入向导）。
 
 ```bash
 promptsync --non-interactive agent --config-dir /srv/promptsync/config
@@ -118,10 +121,10 @@ cd ~/workspace/promptSync
 
 三种方式任选：
 
-1. **复制 server 首次启动打印的密钥**（推荐）：server 启动时会打印完整 hex 和 `config.toml` 路径；把同一串粘贴到 agent 第 3 步，或运行 `promptsync secret --set "<这串>"`。
+1. **复制 server 首次启动打印的密钥**（推荐）：server 启动时会打印完整 hex 和 `config.toml` 路径；把同一串粘贴到 agent 第 2 步，或运行 `promptsync secret --set "<这串>"`。
 2. **输入同一句口令**：
    ```bash
-   # 在向导第 3 步直接输入这句话即可；也可以命令行写入
+   # 在向导的集群密钥步骤直接输入这句话即可；也可以命令行写入
    promptsync secret --set "我们家的同步口令"
    ```
    程序用 PBKDF2-HMAC-SHA256 从这句话推导密钥，所有机器输入**完全相同**的一句话（含空格、大小写）就会得到同一个密钥。不需要记十六进制。
@@ -232,7 +235,7 @@ agent                         server
 - **会话密钥**：HKDF-SHA256 从 ECDH 共享密钥 + 双方 nonce 派生，上下行各一把 AES-256-GCM 密钥。
 - **记录层**：每个报文独立 nonce（方向前缀 + 单调计数），1024 位重放窗口；篡改即认证失败、静默丢弃。
 - **端口敲门（随机化）**：集群密钥推导出 12 个端口的池；每次尝试由 agent 随机选 3–6 个、随机顺序、随机延迟（含首包随机偏移）。报文 HMAC 标签覆盖 `total + slot + flow id + 时间戳`，且校验「收到的端口 == 声明的 slot」，所以包不能被挪到别的端口。必须在 6s 窗口内、来自同一源 IP 集齐声明的 `total` 个不同 slot 才算通过；时间戳仅接受 ±60s，已完成过的 flow id 会被记忆 15 分钟，重放不会二次开门。无效敲门**不回任何包**。
-- **隐藏**：数据端口平时不绑定，只有 gate 打开时临时绑定；无会话/gate 过期后立即关闭。每个源 IP 的 HELLO 限速 20 次/分钟。
+- **隐藏**：数据端口平时不绑定，只有 gate 打开时临时绑定；无会话/gate 过期后立即关闭。每个源 IP 的 HELLO 限速 120 次/分钟（同一出口 IP 的多个 agent、或把 `agent.poll_secs` 调短时也不会互相挤掉）。
 - **文件写入**：先全部写入临时文件再 rename；覆盖前备份到 `config/state/backups/<时间戳>/`；只删除自己上次管理过的文件（`managed.json`），不会误删用户文件；新文件权限 0600。
 - **日志**：只记录 hash 前 16 位、端口、密钥指纹（HKDF 子密钥前 6 字节），不记录密钥、飞书凭据或 prompt 内容。
 
@@ -276,7 +279,7 @@ agent                         server
 - **一键创建**：创建完成即自动绑定，写入 `config/feishu-binding.json`，`owner_open_id` 写回 `config.toml`。
 - **手动粘贴凭据**：校验通过后，优先填写授权账号的 `owner_open_id`，程序直接给该账号发消息并取得私聊 `chat_id`，不依赖私聊发现。留空才会尝试一次性绑定码；普通私聊消息和绑定开始前的历史消息都不会获得控制权。部分租户不通过接口返回 p2p 私聊，此时绑定码无法被程序发现，等待结束后可直接输入 `open_id`，或输入飞书邮箱/手机号（需要通讯录权限）完成绑定。轮询接口报错会立即显示，不再只写 debug 日志。
 - **服务启动后还没绑定**：不用重跑。server/agent 日志都会输出有效期 15 分钟的一次性绑定码；你在飞书里用需要授权的账号向机器人私聊发送该码，就会自动完成绑定并开始工作，过期后日志会给出新码。agent 与 server 同 app 时还会自动继承 server 的 `owner_open_id`，通常连码都不用发。
-- **换账号 / 重新绑定**：重新运行 `promptsync server` 或 `promptsync agent`，在「直接使用已有配置启动？」处选 `n`，进入飞书步骤后选「继续使用这个应用？」否，再走一次一键创建或手动流程。没有单独的绑定命令。绑定记录同时核对 `app_id` 与 `owner_open_id`；更换应用或接收人后，旧绑定不会被继续使用。
+- **换账号 / 重新绑定**：运行 `promptsync server --configure`（或 `promptsync agent --configure`），在飞书步骤选「继续使用这个应用？」否，再走一次一键创建或手动流程。没有单独的绑定命令。绑定记录同时核对 `app_id` 与 `owner_open_id`；更换应用或接收人后，旧绑定不会被继续使用。
 
 非交互环境（systemd/launchd/`--non-interactive`）不会进入向导；在终端里手动跑一次 `promptsync server` 或 `promptsync agent` 配置即可。
 
@@ -295,8 +298,10 @@ agent                         server
 
 `sync.target` 指定"唯一受管文件"，格式 `<source id>/<相对路径>`。向导第 2 步会扫描 `system_prompt.md` / `SOUL.md`：
 
-- 只有一个非空候选：直接选中，并询问"以后只同步这一个文件吗？"（默认是，选是会把该 source 的 globs 收窄到这一个文件）；
-- 有多个非空候选：列出序号让你选；一个都没有时允许手动输入 `sync.target`。
+- 只有一个非空候选：直接选中并把该 source 的 globs 收窄到它，不再额外确认；
+- 有多个非空候选：列出序号让你选；
+- 一个都没有：可直接回车创建 `~/.promptsync/shared/prompt.md`（推荐），也可以手动输入 `sync.target`；
+- 启动时 `sync.target` 为空且只有一个候选：server 会自动识别并写回配置（非交互启动同样生效）。
 
 单文件模式下 bundle 里永远只有这一个文件；`sync.delete_removed = false` 保证以后缩小同步范围时不会删除 agent 上已有的其他文件。
 
@@ -417,6 +422,7 @@ globs = ["*/bots/*/system_prompt.md"]
 - 备份：agent 每次覆盖前把旧文件放到 `config/state/backups/<UTC 时间戳>/<source id>/...`，默认保留 10 份。
 - 客户端适配备份：覆盖 `~/.codex/AGENTS.md` 等文件前，在同目录生成 `<文件名>.<UTC 时间>.bak`，保留 `sync.keep_backups` 份。
 - 查看：`promptsync status`（人类可读）或 `promptsync status --json`。
+- 只读命令（`status` / `ports` / `config-file` / `feishu-test`）**不会创建配置**：目标目录没有 `config.toml` 时直接报 `no config file at ...`，避免在错误的工作目录里生成新的集群密钥。
 
 ---
 
@@ -479,7 +485,7 @@ release 矩阵：`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、`x86
 
 | 现象 | 排查 |
 |---|---|
-| 配置目录不对 / 找不到配置 | `promptsync status` 第一段就打印 `config dir`；用 `--config-dir` 或 `PROMPTSYNC_CONFIG_DIR` 固定 |
+| 配置目录不对 / 找不到配置 | 只读命令不会创建配置，会直接报 `no config file at <路径>`；用 `--config-dir` 或 `PROMPTSYNC_CONFIG_DIR` 指向正确目录 |
 | 服务启动后生成了新的空配置 | 服务的工作目录变了；unit 里设置 `WorkingDirectory` 并传 `--config-dir <绝对路径>` |
 | `no handshake answer` | 两端 `promptsync ports` 看数据端口与敲门端口池是否一致；`cluster_secret` 是否相同；防火墙是否放行整个 UDP 端口池 |
 | `HELLO failed authentication (cluster secret mismatch?)` | 口令不一致，所有机器输入同一句话（`secret --set "同一句口令"`）；旧 64 位 hex 也能用 |

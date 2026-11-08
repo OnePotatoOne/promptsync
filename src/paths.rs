@@ -26,7 +26,10 @@ impl Paths {
     /// 1. `--config-dir`
     /// 2. `--config <file>` (its parent becomes the config directory)
     /// 3. `PROMPTSYNC_CONFIG_DIR`
-    /// 4. `./config` (relative to the current working directory)
+    /// 4. `./config` (relative to the current working directory); when it has
+    ///    no config file yet, an existing `~/.promptsync/config.toml` is
+    ///    reused instead of silently creating a second config with a new
+    ///    cluster secret.
     pub fn resolve(config_file: Option<&Path>, config_dir: Option<&Path>) -> Result<Self> {
         let dir = match (config_dir, config_file) {
             (Some(dir), _) => absolute(dir)?,
@@ -45,7 +48,19 @@ impl Paths {
                     .filter(|value| !value.is_empty());
                 match from_env {
                     Some(value) => absolute(&expand_tilde(&value))?,
-                    None => absolute(Path::new("config"))?,
+                    None => {
+                        let cwd = absolute(Path::new("config"))?;
+                        let home = dirs::home_dir().map(|home| home.join(".promptsync"));
+                        let chosen = default_dir(&cwd, home.as_deref());
+                        if chosen != cwd {
+                            eprintln!(
+                                "[promptsync] 复用已有配置 {}（{} 里还没有 config.toml）；要改目录请传 --config-dir",
+                                chosen.join(CONFIG_FILE_NAME).display(),
+                                cwd.display()
+                            );
+                        }
+                        chosen
+                    }
                 }
             }
         };
@@ -154,6 +169,19 @@ fn render_template(config_dir: &Path) -> Result<String> {
     Ok(text)
 }
 
+/// Pick the implicit config directory. A local `./config/config.toml` always
+/// wins (backwards compatible); otherwise an existing per-user config is
+/// reused so running from another directory does not mint a new secret.
+fn default_dir(cwd: &Path, home: Option<&Path>) -> PathBuf {
+    if cwd.join(CONFIG_FILE_NAME).exists() {
+        return cwd.to_path_buf();
+    }
+    if let Some(home) = home.filter(|home| home.join(CONFIG_FILE_NAME).exists()) {
+        return home.to_path_buf();
+    }
+    cwd.to_path_buf()
+}
+
 fn toml_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -202,6 +230,36 @@ mod tests {
         let text = fs::read_to_string(&paths.config_file).unwrap();
         assert!(text.contains("promptsync"));
         assert!(!text.contains("cluster_secret = \"old\""));
+    }
+
+    #[test]
+    fn default_dir_prefers_a_local_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("config");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(cwd.join(CONFIG_FILE_NAME), "cluster_secret = \"x\"\n").unwrap();
+        let home = temp.path().join("home/.promptsync");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join(CONFIG_FILE_NAME), "cluster_secret = \"x\"\n").unwrap();
+        assert_eq!(default_dir(&cwd, Some(&home)), cwd);
+    }
+
+    #[test]
+    fn default_dir_reuses_the_home_config_when_the_cwd_has_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("config");
+        let home = temp.path().join("home/.promptsync");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join(CONFIG_FILE_NAME), "cluster_secret = \"x\"\n").unwrap();
+        assert_eq!(default_dir(&cwd, Some(&home)), home);
+    }
+
+    #[test]
+    fn default_dir_stays_local_when_nothing_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("config");
+        let home = temp.path().join("home/.promptsync");
+        assert_eq!(default_dir(&cwd, Some(&home)), cwd);
     }
 
     #[test]

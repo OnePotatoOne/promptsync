@@ -605,12 +605,14 @@ pub fn describe(config: &Config) -> String {
     if !config.feishu_app_configured() {
         return "enabled, no app credentials".to_string();
     }
-    let bound = if config.feishu_bound() {
-        "bound"
+    // A configured recipient is not the same as a saved private-chat binding;
+    // say what is actually known here (the binding file is checked separately).
+    let recipient = if config.feishu_bound() {
+        "recipient set"
     } else {
-        "not bound"
+        "no recipient yet"
     };
-    format!("enabled ({bound})")
+    format!("enabled ({recipient})")
 }
 
 /// Send an alert to the bound owner through the app.

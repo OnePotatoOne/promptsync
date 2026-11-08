@@ -23,7 +23,12 @@ use crate::proto::{decode_request, encode_response, Bundle, Manifest, Request, R
 use crate::util::{atomic_write, now_unix};
 use crate::wire::{handshake_kind, Channel, Header, MAX_MESSAGE};
 
-const HELLO_RATE_LIMIT: usize = 20;
+// HELLOs are cheap to reject before authentication, so the limit only needs to
+// stop brute force. It must stay above the legitimate rate: several agents
+// behind one NAT, a short `agent.poll_secs`, or a restart with retries all
+// share the same source IP. At 120/min a single agent can poll every second
+// and twenty agents on a 10s poll still fit.
+const HELLO_RATE_LIMIT: usize = 120;
 const HELLO_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
@@ -73,15 +78,28 @@ struct ServerState {
     next_session_instance: AtomicU64,
     hello_attempts: Mutex<HashMap<IpAddr, Vec<Instant>>>,
     max_sessions: usize,
+    /// Recipient of offline alerts; updated when a binding is established at
+    /// runtime, so a later restart is not required for alerts to work.
+    feishu_owner: crate::feishu_control::OwnerCell,
 }
 
 pub async fn run(
-    config: Config,
+    mut config: Config,
     logger: Logger,
     data_dir: std::path::PathBuf,
     config_file: std::path::PathBuf,
 ) -> Result<()> {
     config.validate()?;
+    // The control channel manages exactly one file. When `sync.target` is empty
+    // (a fresh config started from a service or with --port/--bind skips the
+    // wizard), pick the single candidate instead of silently disabling Feishu.
+    if config.feishu.enabled && config.feishu_app_configured() {
+        if let Err(err) =
+            crate::feishu_control::ensure_target(&mut config, &config_file, &logger, false)
+        {
+            logger.warn(format!("cannot auto-detect sync.target: {err:#}"));
+        }
+    }
     let secret = Arc::new(
         ClusterSecret::resolve(&config.cluster_secret).context("resolving cluster secret")?,
     );
@@ -106,11 +124,42 @@ pub async fn run(
         crate::util::human_bytes(total_bytes(&entries)),
         short_hash(&hash)
     ));
+    logger.info(format!(
+        "受管文件 {} | 数据端口 {}（敲门成功后开放） | 飞书 {}",
+        if config.sync.target.trim().is_empty() {
+            "未设置（飞书控制关闭）".to_string()
+        } else {
+            config.sync.target.trim().to_string()
+        },
+        ports.main,
+        feishu::describe(&config)
+    ));
+    logger.info(format!(
+        "要改配置：编辑 {}，或运行 `promptsync server --configure`（日志 {}）",
+        config_file.display(),
+        logger.path().display()
+    ));
 
     let registry = load_registry(&data_dir);
     if !registry.agents.is_empty() {
         logger.info(format!("tracking {} known agent(s)", registry.agents.len()));
     }
+
+    // A binding file may already carry the recipient even when config.toml has
+    // no owner_open_id yet (e.g. after a restart right after binding).
+    let initial_owner = {
+        let configured = config.feishu.app.owner_open_id.trim();
+        if !configured.is_empty() {
+            configured.to_string()
+        } else {
+            crate::feishu_control::load_binding(&data_dir)
+                .filter(|binding| binding.app_id == config.feishu.app.app_id.trim())
+                .map(|binding| binding.open_id)
+                .filter(|owner| !owner.trim().is_empty())
+                .unwrap_or_default()
+        }
+    };
+    let feishu_owner = crate::feishu_control::owner_cell(&initial_owner);
 
     let state = Arc::new(ServerState {
         gate: Arc::new(Gate::new(Duration::from_secs(config.server.gate_ttl_secs))),
@@ -136,6 +185,7 @@ pub async fn run(
         scan_options,
         registry: Mutex::new(registry),
         data_dir,
+        feishu_owner,
         logger: logger.clone(),
     });
 
@@ -177,6 +227,7 @@ pub async fn run(
                     }
                     let config = state.config.clone();
                     let data_dir = state.data_dir.clone();
+                    let owner = Arc::clone(&state.feishu_owner);
                     let logger = logger.clone();
                     tokio::spawn(async move {
                         if let Err(err) = crate::feishu_control::run(
@@ -185,6 +236,7 @@ pub async fn run(
                             config_file,
                             target,
                             binding,
+                            owner,
                             logger.clone(),
                         )
                         .await
@@ -193,7 +245,9 @@ pub async fn run(
                         }
                     });
                 }
-                Err(err) => logger.error(format!("Feishu control disabled: {err:#}")),
+                Err(err) => logger.warn(format!(
+                    "Feishu control disabled until sync.target is fixed: {err:#}"
+                )),
             }
         }
     } else if !state.config.sync.target.trim().is_empty() {
@@ -712,18 +766,30 @@ impl ServerState {
         if recovered {
             self.logger.info(format!("agent {agent_id} is back online"));
             if self.config.feishu.notify_on_recovery {
-                spawn_feishu(
-                    &self.config,
-                    &self.logger,
-                    feishu::recovery_message("server", agent_id, "server", &peer.to_string()),
-                );
+                self.spawn_feishu(feishu::recovery_message(
+                    "server",
+                    agent_id,
+                    "server",
+                    &peer.to_string(),
+                ));
             }
         }
     }
-}
 
-fn spawn_feishu(config: &Config, logger: &Logger, text: String) {
-    feishu::spawn_notify(config, logger, text);
+    /// Send an alert through the Feishu app, using the recipient that may have
+    /// been learned after startup.
+    fn spawn_feishu(&self, text: String) {
+        let mut config = self.config.clone();
+        if let Some(owner) = self
+            .feishu_owner
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+        {
+            config.feishu.app.owner_open_id = owner;
+        }
+        feishu::spawn_notify(&config, &self.logger, text);
+    }
 }
 
 async fn monitor_agents(state: Arc<ServerState>) {
@@ -767,19 +833,15 @@ async fn monitor_agents(state: Arc<ServerState>) {
                 "agent {agent_id} unreachable for {}s (last peer {})",
                 silent, record.peer
             ));
-            spawn_feishu(
-                &state.config,
-                &state.logger,
-                feishu::offline_alert(
-                    "server-monitor",
-                    &agent_id,
-                    &agent_id,
-                    &record.peer,
-                    silent,
-                    Some(feishu::format_unix(record.last_seen_unix)),
-                    "agent stopped polling the server",
-                ),
-            );
+            state.spawn_feishu(feishu::offline_alert(
+                "server-monitor",
+                &agent_id,
+                &agent_id,
+                &record.peer,
+                silent,
+                Some(feishu::format_unix(record.last_seen_unix)),
+                "agent stopped polling the server",
+            ));
         }
     }
 }
