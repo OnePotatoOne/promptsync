@@ -545,6 +545,7 @@ release 矩阵：`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、`x86
 | 飞书没绑定成功 | 绑定是自动的：接收人优先取 `[feishu.app] owner_open_id`，否则用应用所有者。看日志里去重后的失败原因（多为凭据/权限/未发布）；服务启动后会持续自动重试，也可以填 `owner_open_id` 指定接收人 |
 | 飞书返回 99991663 / permission denied | `app_id`/`app_secret` 不对，或应用没发布、没授予 `im:message:readonly` / `im:message:send_as_bot` |
 | 发消息没反应 | 必须是在**绑定的私聊**里由你本人发**纯文本**；群聊、他人、富文本都会被忽略（日志里有原因） |
+| agent 一直 `no handshake answer`（对端 ping 得通、服务端也在跑） | 敲门包没到：云主机安全组/`ufw` 只放了 22 之类。必须放行 **数据端口 UDP** 和**全部敲门端口**（默认是 20000–60000 里由密钥推导的 12 个，`ufw allow 20000:60000/udp`；想收紧就把 `[server] knock_ports` 固定成几个端口，只放行它们）。服务端日志有 `gate open` 才说明敲门成功 |
 | `--status` 没回 | 命令由**服务端**应答（agent 不读消息）；确认 server 在跑、`sync.target` 已设置、飞书已绑定；日志里应有 `Feishu command: --status` |
 | 覆盖后 agent 没更新 | 确认 `sync.target` 指向的文件确实在 server 的 source glob 内，且 `promptsync status` 的 hash 已变化 |
 
