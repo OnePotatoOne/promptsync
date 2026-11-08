@@ -184,29 +184,34 @@ globs = ["**/*.md", "**/*.txt"]
 
 ### 2.1 自动适配本机客户端
 
-agent 把拉到的 prompt 再写进本机已安装客户端的全局指令文件，覆盖前自动备份：
+agent 把拉到的 prompt 再写进本机**已安装**客户端的全局指令文件，覆盖前自动备份：
 
-| 客户端 | 目标文件 | 覆盖目录的环境变量 |
-|---|---|---|
-| Kimi Code | `~/.kimi-code/AGENTS.md` | `KIMI_CODE_HOME` |
-| DeepSeek Harness | `~/.dsh/AGENTS.md` | `DSH_HOME` |
-| Codex CLI | `~/.codex/AGENTS.md` | `CODEX_HOME` |
-| Claude Code | `~/.claude/CLAUDE.md` | `CLAUDE_CONFIG_DIR` |
-| Cindy（对话身份） | `CindyGlobal/owners/*/bots/cindy-default/SOUL.md` | — |
-| Cindy（pi 会话） | `CindyGlobal/pi-agent-home/AGENTS.md`，需在 `adapt_paths` 里显式加上 | — |
+| id | 客户端 / 会话 | 目标文件 | 覆盖目录的环境变量 |
+|---|---|---|---|
+| `claude` | Claude Code（终端 + Cindy 的 Claude Code 任务） | `~/.claude/CLAUDE.md` | `CLAUDE_CONFIG_DIR` |
+| `codex` | Codex CLI | `~/.codex/AGENTS.md` | `CODEX_HOME` |
+| `cindy-codex` | Cindy 的 Codex 任务 | `CindyGlobal/codex-home/AGENTS.md` | — |
+| `cindy-pi` | Cindy 的 Pi 任务（**对话会话** + 项目会话） | `~/AGENTS.md` | — |
+| `kimi` | Kimi Code | `~/.kimi-code/AGENTS.md` | `KIMI_CODE_HOME` |
+| `deepseek` | DeepSeek Harness | `~/.dsh/AGENTS.md` | `DSH_HOME` |
+| `gemini` | Gemini CLI | `~/.gemini/GEMINI.md` | — |
+| `qwen` | Qwen Code | `~/.qwen/QWEN.md` | — |
+| `opencode` | opencode | `~/.config/opencode/AGENTS.md` | `XDG_CONFIG_HOME` |
+| `pi` | 独立安装的 Pi（装了 Cindy 时由 `cindy-pi` 覆盖，不重复写） | `~/.pi/agent/AGENTS.md` | `PI_CODING_AGENT_DIR` |
+| `cindy` | Cindy 伙伴 / IM 对话的身份 | `CindyGlobal/owners/*/bots/cindy-default/SOUL.md` | — |
 
 - 选哪个 prompt：优先服务端 `sync.target`；否则最大的 `SOUL.md` → 最大的 `system_prompt.md` → 唯一的文件 → 最大的 Markdown。
 - 只在客户端目录已存在（或目标文件已存在）时写入，不会凭空创建一堆目录。
 - 旧文件备份为同目录的 `<文件名>.<UTC 时间>.bak`，保留 `sync.keep_backups` 份（0 = 全部保留）。
 - 内容相同则跳过，不产生备份、不改 mtime。
-- 关闭：`adapt_clients = false`；额外客户端：`adapt_paths = ["~/path/to/AGENTS.md"]`。
+- 关闭全部：`adapt_clients = false`；关闭某几个：`adapt_exclude = ["cindy-pi"]`；额外客户端：`adapt_paths = ["~/path/to/AGENTS.md"]`。
 - 飞书私聊覆盖服务端 prompt 后，服务端本机的客户端也会立即适配。
-- **Cindy 的三类会话读的不是同一个文件**（实测 + 反编译确认）：
-  - `pi` 会话（项目 + 对话，共用 `pi-agent-home`）读 `CindyGlobal/pi-agent-home/AGENTS.md`；
-  - `codex` 会话读 `CindyGlobal/codex-home/AGENTS.md`，而它由 Cindy 每次启动从 `~/.codex/AGENTS.md` **复制**过来（带 `AGENTS.md.xdt-managed` 标记），所以改源文件、别直接改副本；
-  - `cc`（Claude Code）会话读 `~/.claude/CLAUDE.md`；
-  - bot 的 `SOUL.md` 只作用于 **dialogue** 会话的身份，项目会话完全读不到它。
-  - 想让"所有会话吃同一份"，把 `adapt_paths = ["~/Library/Application Support/CindyGlobal/pi-agent-home/AGENTS.md"]` 加上即可（另外两个内置适配器已经覆盖）。
+- **Cindy 各引擎读的不是同一个文件**（Cindy 0.1.128 实测）：
+  - **Pi 任务**（对话会话默认就是 Pi）：Cindy 给每个任务一个临时 agent 目录 `pi-agent-home/run-tmp/<任务>/`，所以 `pi-agent-home/AGENTS.md` **不会被读取**。Pi 还会读取工作目录及其所有父目录里的 `AGENTS.md`，而 Cindy 的任务目录都在家目录下，所以写 `~/AGENTS.md` 就能覆盖全部 Pi 任务。Claude Code 不读 `AGENTS.md`，Codex / Kimi 只读到项目根目录为止，不会重复加载。
+  - **Codex 任务**读 `CindyGlobal/codex-home/AGENTS.md`；Cindy 只在**启动时**从 `~/.codex/AGENTS.md` 复制一次，所以这里直接同步副本，新任务无需重启 Cindy。
+  - **Claude Code 任务**读 `~/.claude/CLAUDE.md`。
+  - Cindy「设置 › 个性化 › 自定义提示词」会追加到每个 Cindy 任务末尾，但存在 Cindy 内部，promptsync 不改它；建议留空或只写与同步 prompt 不冲突的内容。
+  - 改动只对**新建**的任务生效，已经开着的会话保留启动时的指令。
 - `promptsync status` 会列出当前识别到的客户端文件。
 
 ---

@@ -109,19 +109,23 @@ follow_symlinks = false
 # 源集合变小（比如只保留一个文件）时，是否删除 agent 上以前同步过的文件。
 # 默认 false：只停止管理，不删除用户文件。
 delete_removed = false
-# 拉取后把同一个 prompt 自动写入本机已安装客户端的全局指令文件（覆盖前自动备份）：
-#   kimi     <KIMI_CODE_HOME|~/.kimi-code>/AGENTS.md
-#   deepseek <DSH_HOME|~/.dsh>/AGENTS.md
-#   codex    <CODEX_HOME|~/.codex>/AGENTS.md
-#   claude   <CLAUDE_CONFIG_DIR|~/.claude>/CLAUDE.md
-#   cindy    CindyGlobal/owners/*/bots/cindy-default/SOUL.md（只影响对话会话的身份）
-#            codex 会话读 CindyGlobal/codex-home/AGENTS.md，它由 Cindy 从 ~/.codex/AGENTS.md 复制生成
+# 拉取后把同一个 prompt 自动写入本机已安装客户端的全局指令文件（只写已安装的，覆盖前自动备份）：
+#   claude      <CLAUDE_CONFIG_DIR|~/.claude>/CLAUDE.md（终端 + Cindy 的 Claude Code 任务）
+#   codex       <CODEX_HOME|~/.codex>/AGENTS.md
+#   cindy-codex CindyGlobal/codex-home/AGENTS.md（Cindy 的 Codex 任务；不用重启 Cindy）
+#   cindy-pi    ~/AGENTS.md（Cindy 的 Pi 任务：对话 + 项目。Pi 会读工作目录及所有父目录的 AGENTS.md）
+#   kimi        <KIMI_CODE_HOME|~/.kimi-code>/AGENTS.md
+#   deepseek    <DSH_HOME|~/.dsh>/AGENTS.md
+#   gemini      ~/.gemini/GEMINI.md      qwen ~/.qwen/QWEN.md
+#   opencode    <XDG_CONFIG_HOME|~/.config>/opencode/AGENTS.md
+#   pi          <PI_CODING_AGENT_DIR|~/.pi/agent>/AGENTS.md（独立 Pi；装了 Cindy 时改由 cindy-pi 覆盖）
+#   cindy       CindyGlobal/owners/*/bots/cindy-default/SOUL.md（伙伴/IM 对话的身份）
 # 备份为同目录的 <文件名>.<UTC 时间>.bak，保留份数见 keep_backups。
 adapt_clients = true
 # 额外目标文件（绝对路径或 ~/...），用于上面没覆盖的客户端。
-# 想让 Cindy 的所有 pi 会话（项目会话 + 对话会话）也吃同一份，加这一行：
-#   adapt_paths = ["~/Library/Application Support/CindyGlobal/pi-agent-home/AGENTS.md"]
 adapt_paths = []
+# 不想写的客户端 id，例如不想在家目录放 AGENTS.md：adapt_exclude = ["cindy-pi"]
+adapt_exclude = []
 
 # 同步源：bundle 中的路径为 <id>/<相对路径>，所以各机器 home 不同也能对应上。
 [[sync.sources]]

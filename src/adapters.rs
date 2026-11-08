@@ -74,15 +74,29 @@ impl AdaptReport {
     }
 }
 
-/// Detect the clients installed on this machine plus any `sync.adapt_paths`.
+/// Detect the clients installed on this machine plus any `sync.adapt_paths`,
+/// minus the ids listed in `sync.adapt_exclude`.
 pub fn detect(config: &SyncConfig) -> Vec<Adapter> {
     match dirs::home_dir() {
-        Some(home) => detect_with_home(config, &home),
+        Some(home) => {
+            let owners = crate::config::cindy_owners_root();
+            detect_with_roots(config, &home, owners.parent(), Some(&owners))
+        }
         None => Vec::new(),
     }
 }
 
-fn detect_with_home(config: &SyncConfig, home: &Path) -> Vec<Adapter> {
+/// Detection with explicit roots so tests never touch the real machine.
+///
+/// `home` is the user's home directory, `cindy_global` the `CindyGlobal`
+/// directory (None = Cindy not considered) and `cindy_owners` its `owners`
+/// directory used to find bot `SOUL.md` files.
+fn detect_with_roots(
+    config: &SyncConfig,
+    home: &Path,
+    cindy_global: Option<&Path>,
+    cindy_owners: Option<&Path>,
+) -> Vec<Adapter> {
     let mut adapters = Vec::new();
     let mut seen = BTreeSet::new();
 
@@ -118,8 +132,73 @@ fn detect_with_home(config: &SyncConfig, home: &Path) -> Vec<Adapter> {
         env_dir("CLAUDE_CONFIG_DIR").unwrap_or_else(|| home.join(".claude")),
         "CLAUDE.md",
     );
-    // Cindy desktop: the prompt of the local bot.
-    if let Some(path) = cindy_prompt() {
+    // Gemini CLI (`~/.gemini/GEMINI.md`).
+    push_client(
+        &mut adapters,
+        &mut seen,
+        "gemini",
+        home.join(".gemini"),
+        "GEMINI.md",
+    );
+    // Qwen Code (`~/.qwen/QWEN.md`).
+    push_client(
+        &mut adapters,
+        &mut seen,
+        "qwen",
+        home.join(".qwen"),
+        "QWEN.md",
+    );
+    // opencode (`$XDG_CONFIG_HOME/opencode/AGENTS.md`, default ~/.config).
+    push_client(
+        &mut adapters,
+        &mut seen,
+        "opencode",
+        env_dir("XDG_CONFIG_HOME")
+            .unwrap_or_else(|| home.join(".config"))
+            .join("opencode"),
+        "AGENTS.md",
+    );
+
+    // Cindy runs Codex with CODEX_HOME=CindyGlobal/codex-home and copies
+    // ~/.codex/AGENTS.md there only when the app starts. Writing the copy too
+    // lets new Cindy Codex tasks see an update without restarting Cindy.
+    if let Some(global) = cindy_global {
+        push_client(
+            &mut adapters,
+            &mut seen,
+            "cindy-codex",
+            global.join("codex-home"),
+            "AGENTS.md",
+        );
+    }
+    // Cindy's Pi tasks (dialogues and projects) get a fresh per-task agent dir
+    // under pi-agent-home/run-tmp/, so pi-agent-home/AGENTS.md is never read.
+    // Pi does load AGENTS.md from the working directory and every parent, and
+    // all Cindy task directories live below the home directory, so ~/AGENTS.md
+    // reaches every one of them. Claude Code ignores AGENTS.md, and Codex and
+    // Kimi stop at the project root, so this does not duplicate their prompt.
+    let cindy_pi = cindy_global
+        .map(|global| global.join("pi-agent-home").is_dir())
+        .unwrap_or(false);
+    if cindy_pi {
+        push_unique(
+            &mut adapters,
+            &mut seen,
+            "cindy-pi".to_string(),
+            home.join("AGENTS.md"),
+        );
+    } else {
+        // Standalone Pi (`$PI_CODING_AGENT_DIR` or ~/.pi/agent). Skipped when
+        // ~/AGENTS.md is written: Pi would read the same prompt twice.
+        let pi_dir = env_dir("PI_CODING_AGENT_DIR")
+            // Inside a Cindy task this points at a throwaway run-tmp dir.
+            .filter(|dir| !dir.to_string_lossy().contains("CindyGlobal"))
+            .unwrap_or_else(|| home.join(".pi").join("agent"));
+        push_client(&mut adapters, &mut seen, "pi", pi_dir, "AGENTS.md");
+    }
+
+    // Cindy bot persona (used by teammate/IM conversations).
+    if let Some(path) = cindy_owners.and_then(cindy_prompt_under) {
         push_unique(&mut adapters, &mut seen, "cindy".to_string(), path);
     }
 
@@ -136,6 +215,13 @@ fn detect_with_home(config: &SyncConfig, home: &Path) -> Vec<Adapter> {
         push_unique(&mut adapters, &mut seen, id, path);
     }
 
+    // `sync.adapt_exclude` switches individual clients off by id.
+    adapters.retain(|adapter| {
+        !config
+            .adapt_exclude
+            .iter()
+            .any(|excluded| excluded.trim().eq_ignore_ascii_case(&adapter.id))
+    });
     adapters
 }
 
@@ -175,11 +261,8 @@ fn push_unique(
 }
 
 /// Cindy keeps one prompt per bot under `owners/<owner>/bots/<bot>/SOUL.md`.
-/// Prefer the local `cindy-default` bot, then the newest prompt.
-fn cindy_prompt() -> Option<PathBuf> {
-    cindy_prompt_under(&crate::config::cindy_owners_root())
-}
-
+/// Prefer the local `cindy-default` bot, then the newest prompt. `root` is the
+/// `owners` directory.
 fn cindy_prompt_under(root: &Path) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     for owner in fs::read_dir(root).ok()?.flatten() {
@@ -427,12 +510,76 @@ mod tests {
             adapt_paths: vec![extra.display().to_string()],
             ..SyncConfig::default()
         };
-        let adapters = detect_with_home(&config, home);
+        let adapters = detect_with_roots(&config, home, None, None);
         let ids: Vec<&str> = adapters.iter().map(|adapter| adapter.id.as_str()).collect();
         for expected in ["kimi", "deepseek", "codex", "claude", "agents"] {
             assert!(ids.contains(&expected), "missing {expected} in {ids:?}");
         }
         assert!(adapters.iter().any(|adapter| adapter.path == extra));
+    }
+
+    /// Cindy Pi tasks read ~/AGENTS.md (their agent dir is a per-task temp
+    /// dir), Cindy Codex tasks read codex-home/AGENTS.md; standalone Pi is
+    /// skipped then so it does not load the prompt twice.
+    #[test]
+    fn covers_cindy_task_engines_and_common_clients() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let global = temp.path().join("CindyGlobal");
+        for dir in [".gemini", ".qwen", ".config/opencode", ".pi/agent"] {
+            fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        for dir in [
+            "codex-home",
+            "pi-agent-home",
+            "owners/o1/bots/cindy-default",
+        ] {
+            fs::create_dir_all(global.join(dir)).unwrap();
+        }
+        fs::write(global.join("owners/o1/bots/cindy-default/SOUL.md"), "soul").unwrap();
+        let config = SyncConfig::default();
+        let adapters =
+            detect_with_roots(&config, &home, Some(&global), Some(&global.join("owners")));
+        let find = |id: &str| adapters.iter().find(|adapter| adapter.id == id);
+        assert_eq!(find("cindy-pi").unwrap().path, home.join("AGENTS.md"));
+        assert_eq!(
+            find("cindy-codex").unwrap().path,
+            global.join("codex-home/AGENTS.md")
+        );
+        assert_eq!(find("gemini").unwrap().path, home.join(".gemini/GEMINI.md"));
+        assert_eq!(find("qwen").unwrap().path, home.join(".qwen/QWEN.md"));
+        assert!(find("opencode").is_some());
+        assert!(find("cindy").is_some());
+        assert!(
+            find("pi").is_none(),
+            "standalone pi would read ~/AGENTS.md twice"
+        );
+
+        // Without Cindy, standalone Pi gets its own global file.
+        let adapters = detect_with_roots(&config, &home, None, None);
+        assert!(adapters
+            .iter()
+            .any(|adapter| adapter.id == "pi" && adapter.path == home.join(".pi/agent/AGENTS.md")));
+        assert!(!adapters.iter().any(|adapter| adapter.id == "cindy-pi"));
+    }
+
+    #[test]
+    fn adapt_exclude_switches_clients_off() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let global = temp.path().join("CindyGlobal");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::create_dir_all(global.join("pi-agent-home")).unwrap();
+        let config = SyncConfig {
+            adapt_exclude: vec!["Cindy-Pi".to_string()],
+            ..SyncConfig::default()
+        };
+        let ids: Vec<String> = detect_with_roots(&config, &home, Some(&global), None)
+            .into_iter()
+            .map(|adapter| adapter.id)
+            .collect();
+        assert!(ids.contains(&"claude".to_string()));
+        assert!(!ids.contains(&"cindy-pi".to_string()), "{ids:?}");
     }
 
     #[test]

@@ -156,11 +156,15 @@ pub struct SyncConfig {
     /// Off by default: shrinking the source set never removes user files.
     pub delete_removed: bool,
     /// Copy the synced prompt into the global instruction file of every
-    /// detected coding agent (Codex, Claude, Kimi, DeepSeek, Cindy).
+    /// detected coding agent (Claude, Codex, Kimi, DeepSeek, Gemini, Qwen,
+    /// opencode, Pi and Cindy's Pi/Codex tasks).
     pub adapt_clients: bool,
     /// Extra instruction files to update, on top of the auto-detected ones.
     /// Absolute paths or `~/...`.
     pub adapt_paths: Vec<String>,
+    /// Adapter ids to skip (e.g. `["cindy-pi"]` to keep ~/AGENTS.md untouched).
+    /// See `promptsync status` for the ids detected on this machine.
+    pub adapt_exclude: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,6 +275,7 @@ impl Default for SyncConfig {
             delete_removed: false,
             adapt_clients: true,
             adapt_paths: Vec::new(),
+            adapt_exclude: Vec::new(),
         }
     }
 }
