@@ -704,16 +704,22 @@ fn finish_feishu(config: &mut Config, paths: &Paths, logger: &Logger, role: Role
         Role::Agent => feishu_control::BindingPurpose::Agent,
     };
     match feishu_control::ensure_binding(config, paths, logger, true, purpose) {
-        Ok(Some(binding)) => match role {
-            Role::Server => println!(
-                "飞书已自动绑定：接收人 open_id {}（确认消息已发送，之后直接在这个私聊里发纯文本即可）。",
-                binding.open_id
-            ),
-            Role::Agent => println!(
-                "飞书告警已自动绑定：接收人 open_id {}（确认消息已发送）。",
-                binding.open_id
-            ),
-        },
+        Ok(Some(binding)) => {
+            match role {
+                Role::Server => println!(
+                    "飞书已自动绑定：接收人 open_id {}（确认消息已发送，之后直接在这个私聊里发纯文本即可）。",
+                    binding.open_id
+                ),
+                Role::Agent => println!(
+                    "飞书告警已自动绑定：接收人 open_id {}（确认消息已发送）。",
+                    binding.open_id
+                ),
+            }
+            println!("注意：server 与 agent 绑定的是同一个飞书应用（app_id 相同），只需要绑一次；");
+            println!(
+                "      私聊里发 --help 可以查状态（--status / --agents / --config），以 -- 开头的消息只查询，不会覆盖文件。"
+            );
+        }
         Ok(None) => {
             println!("飞书已启用，但这次没能自动绑定；启动后会继续自动重试，不会让你去发绑定码。");
             println!("要指定别人接收，可在 config.toml 的 [feishu.app] 填写 owner_open_id。");

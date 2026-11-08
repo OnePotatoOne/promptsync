@@ -244,10 +244,14 @@ impl BindingPurpose {
     /// nothing has to be answered by hand.
     fn success_message(self) -> &'static str {
         match self {
-            BindingPurpose::Server => {
-                "promptsync 绑定成功。以后直接把纯文本 prompt 发给我，我会覆盖服务端的那个文件。"
-            }
-            BindingPurpose::Agent => "promptsync agent 绑定成功。之后离线告警会发到这个私聊。",
+            BindingPurpose::Server => concat!(
+                "promptsync 绑定成功。以后把纯文本 prompt 发给我就会覆盖服务端的那个文件；",
+                "发 --help 看我支持的状态命令（--status / --agents / --config）。"
+            ),
+            BindingPurpose::Agent => concat!(
+                "promptsync agent 绑定成功。之后离线告警会发到这个私聊；",
+                "server 和 agent 用的是同一个飞书应用，-- 开头的命令由服务端应答。"
+            ),
         }
     }
 }
