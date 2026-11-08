@@ -803,6 +803,15 @@ fn print_summary(config: &Config, paths: &Paths, role: Role) {
                 "轮询/离线    {}s / {}s",
                 config.agent.poll_secs, config.agent.offline_threshold_secs
             );
+            // A hand-typed port is the classic cause of a silent handshake
+            // failure: the server derives its data port from the same secret,
+            // so a pinned number only works when the server pins it too.
+            if config.agent.port != 0 && config.agent.port != ports.main {
+                println!(
+                    "⚠ 端口填的是 {}，但用同一密钥推导出来的是 {}；除非服务端 [server] 里也写了 port = {}，否则这一步应该填 0（握手会一直超时）。",
+                    config.agent.port, ports.main, config.agent.port
+                );
+            }
         }
         println!("节点 ID      {}", crate::agent::effective_agent_id(config));
         println!(
