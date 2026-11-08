@@ -778,6 +778,17 @@ fn print_summary(config: &Config, paths: &Paths, role: Role) {
                 ports.knock_pool.len(),
                 ports.knock_pool
             );
+            // A cloud VM or a host firewall silences the knocks, and the agent
+            // can then only report "no handshake answer": the server never
+            // opens its data port, so there is nothing to answer with.
+            println!(
+                "⚠ 防火墙      云主机/ufw 必须放行 UDP {} 和全部敲门端口，否则 agent 只会看到 no handshake answer。",
+                ports.main
+            );
+            println!(
+                "              例如：sudo ufw allow {}/udp && sudo ufw allow 20000:60000/udp（或把 [server] knock_ports 固定成几个端口，只放行它们）",
+                ports.main
+            );
         }
         println!(
             "受管文件     {}",
