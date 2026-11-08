@@ -9,6 +9,7 @@
 pub mod adapters;
 pub mod agent;
 pub mod buildinfo;
+pub mod commands;
 pub mod config;
 pub mod crypto;
 pub mod feishu;

@@ -185,7 +185,8 @@ agent 把拉到的 prompt 再写进本机已安装客户端的全局指令文件
 | DeepSeek Harness | `~/.dsh/AGENTS.md` | `DSH_HOME` |
 | Codex CLI | `~/.codex/AGENTS.md` | `CODEX_HOME` |
 | Claude Code | `~/.claude/CLAUDE.md` | `CLAUDE_CONFIG_DIR` |
-| Cindy | `CindyGlobal/owners/*/bots/cindy-default/SOUL.md` | — |
+| Cindy（对话身份） | `CindyGlobal/owners/*/bots/cindy-default/SOUL.md` | — |
+| Cindy（pi 会话） | `CindyGlobal/pi-agent-home/AGENTS.md`，需在 `adapt_paths` 里显式加上 | — |
 
 - 选哪个 prompt：优先服务端 `sync.target`；否则最大的 `SOUL.md` → 最大的 `system_prompt.md` → 唯一的文件 → 最大的 Markdown。
 - 只在客户端目录已存在（或目标文件已存在）时写入，不会凭空创建一堆目录。
@@ -193,6 +194,12 @@ agent 把拉到的 prompt 再写进本机已安装客户端的全局指令文件
 - 内容相同则跳过，不产生备份、不改 mtime。
 - 关闭：`adapt_clients = false`；额外客户端：`adapt_paths = ["~/path/to/AGENTS.md"]`。
 - 飞书私聊覆盖服务端 prompt 后，服务端本机的客户端也会立即适配。
+- **Cindy 的三类会话读的不是同一个文件**（实测 + 反编译确认）：
+  - `pi` 会话（项目 + 对话，共用 `pi-agent-home`）读 `CindyGlobal/pi-agent-home/AGENTS.md`；
+  - `codex` 会话读 `CindyGlobal/codex-home/AGENTS.md`，而它由 Cindy 每次启动从 `~/.codex/AGENTS.md` **复制**过来（带 `AGENTS.md.xdt-managed` 标记），所以改源文件、别直接改副本；
+  - `cc`（Claude Code）会话读 `~/.claude/CLAUDE.md`；
+  - bot 的 `SOUL.md` 只作用于 **dialogue** 会话的身份，项目会话完全读不到它。
+  - 想让"所有会话吃同一份"，把 `adapt_paths = ["~/Library/Application Support/CindyGlobal/pi-agent-home/AGENTS.md"]` 加上即可（另外两个内置适配器已经覆盖）。
 - `promptsync status` 会列出当前识别到的客户端文件。
 
 ---
@@ -294,7 +301,8 @@ agent                         server
 - 内容与现有文件一致时不写盘、不产生新的 hash，只回"无变化"；
 - 超过 `feishu.control.max_message_bytes`（默认 32 KiB）直接拒绝，不会截断；
 - 服务端回一条回执：`✅ 已更新 <source id/相对路径>（xxx B，sha256 xxxxxxxx）`；
-- 写盘后 2 秒内 watcher 重算 hash、epoch+1，所有 agent 在 10 秒内拉到新内容。
+- 写盘后 2 秒内 watcher 重算 hash、epoch+1，所有 agent 在 10 秒内拉到新内容；
+- **以 `--` 开头的消息是命令，不是 prompt**：只回状态，绝不覆盖文件（见 [5.5](#55-在飞书里查状态--命令)）。
 
 `sync.target` 指定"唯一受管文件"，格式 `<source id>/<相对路径>`。向导第 2 步会扫描 `system_prompt.md` / `SOUL.md`：
 
@@ -326,6 +334,48 @@ promptsync feishu-test --text "自定义内容"
 > agent 平时只用 Feishu 发告警，不读 prompt 内容；绑定阶段只是由程序主动给接收人发一条消息，不需要你回消息。它的配置里需要 `[feishu.app]` 的 `app_id`、`app_secret`，并保持 `[feishu] enabled = true`；`owner_open_id` 可以从 server 自动继承，也可以留空——留空时程序会用**应用所有者**自动补齐。只授予 `im:message:send_as_bot` 的应用也能自动绑定，因为绑定不需要读消息。
 >
 > **权限取舍**：飞书应用的权限是应用级的。agent 要自己发离线告警，就需要在自己的机器上配置同一个 `app_id`/`app_secret`（也就意味着那台机器上的凭据具备应用的全部权限）。如果你介意，可以：给 agent 单独创建一个"只发消息"的应用（`im:message:send_as_bot` 即可，不授予只读权限），在 agent 的配置里填那套凭据；服务端仍用完整的应用。两套凭据互不影响。
+
+---
+
+### 5.5 在飞书里查状态：`--` 命令
+
+server 与 agent 绑定同一个飞书应用时，直接给机器人私聊发**以 `--` 开头的纯文本**即可查询运行状态。这类消息只读，**不会**覆盖受管文件；命令由正在运行的服务端应答。
+
+| 命令 | 输出 |
+|---|---|
+| `--status` | 版本/构建指纹、受管文件、hash 与 epoch、更新时间、数据端口、在线 agent 数、飞书绑定、日志路径 |
+| `--agents` | 每台 agent 一行：`●` 在线 / `○` 离线、名称、最后心跳秒数、地址、内容 hash |
+| `--config` | 生效配置：配置文件、密钥**指纹**（不打印密钥本体）、监听地址、端口数、受管文件、飞书 app/接收人、dry-run |
+| `--ports` | 数据端口、敲门端口池、密钥指纹 |
+| `--version` | 版本与构建指纹 |
+| `--whoami` | 当前绑定的飞书应用、接收人、私聊 `chat_id`、绑定时间 |
+| `--help` | 使用手册 |
+
+```
+--status
+promptsync 0.3.2 build e7d7045f2e04
+受管文件  cindy-bots/acme/bots/cindy/SOUL.md
+内容      hash 9a43307bd06e | epoch 7 | 2026-11-08 20:31:02Z
+数据端口  57394（敲门成功后开放）
+agent     1 台在线 / 共 2 台（在线窗口 120s）
+飞书      已绑定 oc_75c6…b23c
+```
+
+```
+--agents
+agent 列表（1 台在线 / 共 2 台，在线窗口 120s）
+● Mac.lan               8s 前  100.90.145.64   9a43307bd06e
+○ win-office         2m03s 前  10.0.0.8        -
+● 在线　○ 离线
+```
+
+规则：
+
+- 只有**绑定私聊 + 本人**发的消息才处理（和其它消息一致）；
+- 认不出命令（如 `--foo`）时，回复"未识别的命令：--foo" + 完整使用手册，**不会**把它当成 prompt 写盘；
+- `--status` 里的接收人、app_id 都做了掩码，密钥只显示指纹；
+- 在线窗口取 `agent.offline_threshold_secs`（至少 30s），和离线告警阈值一致；
+- 例外：正文以 Markdown front matter `---` + 换行开头时仍按 prompt 写入，方便贴带头的模板；单独一个 `--` 则等于 `--help`。
 
 ---
 
@@ -495,6 +545,7 @@ release 矩阵：`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、`x86
 | 飞书没绑定成功 | 绑定是自动的：接收人优先取 `[feishu.app] owner_open_id`，否则用应用所有者。看日志里去重后的失败原因（多为凭据/权限/未发布）；服务启动后会持续自动重试，也可以填 `owner_open_id` 指定接收人 |
 | 飞书返回 99991663 / permission denied | `app_id`/`app_secret` 不对，或应用没发布、没授予 `im:message:readonly` / `im:message:send_as_bot` |
 | 发消息没反应 | 必须是在**绑定的私聊**里由你本人发**纯文本**；群聊、他人、富文本都会被忽略（日志里有原因） |
+| `--status` 没回 | 命令由**服务端**应答（agent 不读消息）；确认 server 在跑、`sync.target` 已设置、飞书已绑定；日志里应有 `Feishu command: --status` |
 | 覆盖后 agent 没更新 | 确认 `sync.target` 指向的文件确实在 server 的 source glob 内，且 `promptsync status` 的 hash 已变化 |
 
 调试：`--log-level debug` 启动，或 `RUST_BACKTRACE=1`。

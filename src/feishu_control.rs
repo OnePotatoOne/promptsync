@@ -1,5 +1,8 @@
 //! Feishu control channel: first-start binding and the ingest loop that turns
 //! private-chat text messages into the one managed prompt file.
+//!
+//! Messages that start with `--` are commands (see [`crate::commands`]): they
+//! are answered with a status view and never touch the managed file.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -30,6 +33,10 @@ const MAX_TRACKED_FAILURES: usize = 256;
 /// The recipient used for offline alerts. Binding can happen after startup, so
 /// the server keeps this in memory and every alert re-reads it.
 pub type OwnerCell = Arc<Mutex<Option<String>>>;
+
+/// Builds the read-only view answered by `--commands`. The server passes a
+/// closure so every command sees live state (epoch, online agents, binding).
+pub type StatusProvider = Arc<dyn Fn() -> crate::commands::Status + Send + Sync>;
 
 pub fn owner_cell(owner: &str) -> OwnerCell {
     let trimmed = owner.trim();
@@ -478,6 +485,7 @@ pub async fn run(
     binding: Option<Binding>,
     owner: OwnerCell,
     logger: Logger,
+    status: StatusProvider,
 ) -> Result<()> {
     let client = Arc::new(FeishuClient::from_config(&config)?);
     let poll_secs = config.feishu.control.poll_secs.max(2);
@@ -518,8 +526,9 @@ pub async fn run(
         let target = target.clone();
         let config = config.clone();
         let snapshot = cursor.clone();
+        let status = Arc::clone(&status);
         let outcome = tokio::task::spawn_blocking(move || {
-            poll_once(&config, &client, &binding, &target, &snapshot)
+            poll_once(&config, &client, &binding, &target, &snapshot, &status)
         })
         .await;
         match outcome {
@@ -648,6 +657,7 @@ fn poll_once(
     binding: &Binding,
     target: &TargetFile,
     cursor: &Cursor,
+    status: &StatusProvider,
 ) -> Result<PollOutcome> {
     let mut cursor = cursor.clone();
     let now = now_unix();
@@ -671,6 +681,24 @@ fn poll_once(
         }
         if message.sender_id != binding.open_id {
             cursor.record(&message.id, message.create_time_ms);
+            continue;
+        }
+
+        // A `--command` is a query, not prompt content: answer it and leave the
+        // managed file alone. Unknown verbs get the manual, never a write.
+        let text = message_text(&message);
+        if let Some(command) = text
+            .as_deref()
+            .and_then(|text| crate::commands::handle(text, &status()))
+        {
+            cursor.record(&message.id, message.create_time_ms);
+            log_message = Some(format!(
+                "Feishu command: {}",
+                text.as_deref().unwrap_or_default().trim()
+            ));
+            if let Err(err) = client.send_text_to_chat(&binding.chat_id, &command) {
+                log_message = Some(format!("Feishu command reply failed: {err:#}"));
+            }
             continue;
         }
 
@@ -1030,6 +1058,11 @@ mod tests {
         }
     }
 
+    /// Commands are not exercised by most tests; they get an empty status.
+    fn no_status() -> StatusProvider {
+        Arc::new(crate::commands::Status::default)
+    }
+
     fn fixture(mock: &MockFeishu) -> (Config, tempfile::TempDir, TargetFile, Binding, Cursor) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("owners");
@@ -1140,7 +1173,8 @@ mod tests {
         mock.push_text("new prompt\nsecond line", "ou_owner");
         let (config, _temp, target, binding, cursor) = fixture(&mock);
         let client = FeishuClient::new(&config.feishu.app, Duration::from_secs(5)).unwrap();
-        let outcome = poll_once(&config, &client, &binding, &target, &cursor).unwrap();
+        let outcome =
+            poll_once(&config, &client, &binding, &target, &cursor, &no_status()).unwrap();
 
         let content = fs::read_to_string(&target.path).unwrap();
         assert_eq!(content, "new prompt\nsecond line\n");
@@ -1163,12 +1197,46 @@ mod tests {
     }
 
     #[test]
+    fn commands_reply_without_touching_the_managed_file() {
+        let mock = MockFeishu::start();
+        mock.push_text("--status", "ou_owner");
+        mock.push_text("--bogus", "ou_owner");
+        let (config, _temp, target, binding, cursor) = fixture(&mock);
+        let before = fs::read_to_string(&target.path).unwrap();
+        let client = FeishuClient::new(&config.feishu.app, Duration::from_secs(5)).unwrap();
+        let status: StatusProvider = Arc::new(|| crate::commands::Status {
+            target: "cindy/acme/bots/cindy/system_prompt.md".to_string(),
+            data_port: 12345,
+            agents: vec![crate::commands::AgentRow {
+                id: "Mac.lan".to_string(),
+                last_seen_unix: now_unix(),
+                peer: "127.0.0.1".to_string(),
+                hash: "abc123456789".to_string(),
+            }],
+            online_window_secs: 120,
+            now: now_unix(),
+            ..Default::default()
+        });
+
+        let outcome = poll_once(&config, &client, &binding, &target, &cursor, &status).unwrap();
+
+        assert_eq!(fs::read_to_string(&target.path).unwrap(), before);
+        let acks = mock.acks();
+        assert_eq!(acks.len(), 2, "{acks:?}");
+        assert!(acks[0].contains("12345"), "{}", acks[0]);
+        assert!(acks[0].contains("1 台在线"), "{}", acks[0]);
+        assert!(acks[1].contains("未识别的命令：--bogus"), "{}", acks[1]);
+        assert!(outcome.log_message.unwrap().contains("Feishu command"));
+    }
+
+    #[test]
     fn ignores_other_senders_and_non_text_and_duplicates() {
         let mock = MockFeishu::start();
         mock.push_text("from a stranger", "ou_someone");
         let (mut config, _temp, target, binding, cursor) = fixture(&mock);
         let client = FeishuClient::new(&config.feishu.app, Duration::from_secs(5)).unwrap();
-        let outcome = poll_once(&config, &client, &binding, &target, &cursor).unwrap();
+        let outcome =
+            poll_once(&config, &client, &binding, &target, &cursor, &no_status()).unwrap();
         assert_eq!(fs::read_to_string(&target.path).unwrap(), "old prompt\n");
         assert!(outcome.log_message.is_none());
 
@@ -1182,7 +1250,8 @@ mod tests {
             "sender": { "id": "ou_owner", "sender_type": "user" },
             "chat_id": "oc_p2p",
         }));
-        let outcome = poll_once(&config, &client, &binding, &target, &cursor).unwrap();
+        let outcome =
+            poll_once(&config, &client, &binding, &target, &cursor, &no_status()).unwrap();
         assert!(outcome.log_message.is_none());
         assert_eq!(fs::read_to_string(&target.path).unwrap(), "old prompt\n");
         assert!(mock.acks().iter().any(|ack| ack.contains("纯文本")));
@@ -1191,7 +1260,7 @@ mod tests {
         config.feishu.control.dry_run = true;
         mock.messages.lock().unwrap().clear();
         mock.push_text("dry run content", "ou_owner");
-        let _ = poll_once(&config, &client, &binding, &target, &cursor).unwrap();
+        let _ = poll_once(&config, &client, &binding, &target, &cursor, &no_status()).unwrap();
         assert_eq!(fs::read_to_string(&target.path).unwrap(), "old prompt\n");
         assert!(mock.acks().iter().any(|ack| ack.contains("dry-run")));
     }
@@ -1203,7 +1272,8 @@ mod tests {
         let (config, _temp, target, binding, cursor) = fixture(&mock);
         let client = FeishuClient::new(&config.feishu.app, Duration::from_secs(5)).unwrap();
         let before = fs::metadata(&target.path).unwrap().modified().unwrap();
-        let outcome = poll_once(&config, &client, &binding, &target, &cursor).unwrap();
+        let outcome =
+            poll_once(&config, &client, &binding, &target, &cursor, &no_status()).unwrap();
         assert!(outcome.log_message.is_none());
         assert_eq!(
             fs::metadata(&target.path).unwrap().modified().unwrap(),
@@ -1219,7 +1289,8 @@ mod tests {
         let (mut config, _temp, target, binding, cursor) = fixture(&mock);
         config.feishu.control.max_message_bytes = 1024;
         let client = FeishuClient::new(&config.feishu.app, Duration::from_secs(5)).unwrap();
-        let outcome = poll_once(&config, &client, &binding, &target, &cursor).unwrap();
+        let outcome =
+            poll_once(&config, &client, &binding, &target, &cursor, &no_status()).unwrap();
         assert_eq!(fs::read_to_string(&target.path).unwrap(), "old prompt\n");
         assert!(outcome.log_message.unwrap().contains("rejected"));
         assert!(mock.acks().iter().any(|ack| ack.contains("超过上限")));
@@ -1254,14 +1325,30 @@ mod tests {
         fs::create_dir_all(&target.path).unwrap();
         let client = FeishuClient::new(&config.feishu.app, Duration::from_secs(5)).unwrap();
 
-        let first = poll_once(&config, &client, &binding, &target, &cursor).unwrap();
+        let first = poll_once(&config, &client, &binding, &target, &cursor, &no_status()).unwrap();
         assert!(!first.cursor.seen("m-0"));
         assert_eq!(first.cursor.failures.get("m-0").copied(), Some(1));
         assert!(first.log_message.as_deref().unwrap().contains("will retry"));
 
-        let second = poll_once(&config, &client, &binding, &target, &first.cursor).unwrap();
+        let second = poll_once(
+            &config,
+            &client,
+            &binding,
+            &target,
+            &first.cursor,
+            &no_status(),
+        )
+        .unwrap();
         assert!(!second.cursor.seen("m-0"));
-        let third = poll_once(&config, &client, &binding, &target, &second.cursor).unwrap();
+        let third = poll_once(
+            &config,
+            &client,
+            &binding,
+            &target,
+            &second.cursor,
+            &no_status(),
+        )
+        .unwrap();
         assert!(third.cursor.seen("m-0"));
         assert_eq!(third.cursor.failures.get("m-0"), None);
 

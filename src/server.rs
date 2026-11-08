@@ -13,6 +13,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::buildinfo;
+use crate::commands;
 use crate::config::Config;
 use crate::crypto::{accept_hello, ClusterSecret, SessionKeys, MAX_CLOCK_SKEW_SECS, TYPE_HELLO};
 use crate::feishu;
@@ -31,7 +32,7 @@ use crate::wire::{handshake_kind, Channel, Header, MAX_MESSAGE};
 const HELLO_RATE_LIMIT: usize = 120;
 const HELLO_RATE_WINDOW: Duration = Duration::from_secs(60);
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Snapshot {
     epoch: u64,
     hash: String,
@@ -71,6 +72,8 @@ struct ServerState {
     gate: Arc<Gate>,
     registry: Mutex<AgentRegistry>,
     data_dir: std::path::PathBuf,
+    /// Config path shown by `--status` / `--config`.
+    config_file: std::path::PathBuf,
     logger: Logger,
     knocks: Arc<KnockTracker>,
     sessions: Mutex<HashMap<[u8; 8], SessionEntry>>,
@@ -185,6 +188,7 @@ pub async fn run(
         scan_options,
         registry: Mutex::new(registry),
         data_dir,
+        config_file,
         feishu_owner,
         logger: logger.clone(),
     });
@@ -227,17 +231,24 @@ pub async fn run(
                     }
                     let config = state.config.clone();
                     let data_dir = state.data_dir.clone();
+                    let feishu_config_file = state.config_file.clone();
                     let owner = Arc::clone(&state.feishu_owner);
                     let logger = logger.clone();
+                    // `--commands` read this live, so a reply always shows the
+                    // current epoch, port and agent list.
+                    let status_state = Arc::clone(&state);
+                    let status: crate::feishu_control::StatusProvider =
+                        Arc::new(move || command_status(&status_state));
                     tokio::spawn(async move {
                         if let Err(err) = crate::feishu_control::run(
                             config,
                             data_dir,
-                            config_file,
+                            feishu_config_file,
                             target,
                             binding,
                             owner,
                             logger.clone(),
+                            status,
                         )
                         .await
                         {
@@ -274,6 +285,91 @@ pub async fn run(
             "data port {bind_addr_text} closed again (nobody authorised)"
         ));
     }
+}
+
+/// Collect the numbers printed by a `--command` reply.
+///
+/// Called from the Feishu ingest loop on every command, so it stays read-only
+/// and cheap: three short lock acquisitions and one small file read.
+fn command_status(state: &Arc<ServerState>) -> commands::Status {
+    let snapshot = state
+        .snapshot
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    let ports = server_ports(&state.config.server, &state.secret);
+    let binding = crate::feishu_control::load_binding(&state.data_dir);
+    let mut agents: Vec<commands::AgentRow> = state
+        .registry
+        .lock()
+        .map(|registry| {
+            registry
+                .agents
+                .iter()
+                .map(|(id, record)| commands::AgentRow {
+                    id: id.clone(),
+                    last_seen_unix: record.last_seen_unix,
+                    peer: record.peer.clone(),
+                    hash: record.hash.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    agents.sort_by_key(|agent| std::cmp::Reverse(agent.last_seen_unix));
+
+    commands::Status {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build: buildinfo::fingerprint().to_string(),
+        config_file: state.config_file.display().to_string(),
+        log_file: state.logger.path().display().to_string(),
+        target: state.config.sync.target.trim().to_string(),
+        hash: snapshot.hash.clone(),
+        epoch: snapshot.epoch,
+        files: snapshot.entries.len(),
+        bytes: total_bytes(&snapshot.entries),
+        updated_unix: snapshot.updated_unix,
+        bind_addr: state.config.server.bind.clone(),
+        data_port: ports.main,
+        knock_pool: ports.knock_pool.clone(),
+        secret_fingerprint: state.secret.fingerprint(),
+        feishu_app: mask_id(state.config.feishu.app.app_id.trim()),
+        feishu_owner: mask_id(&binding_owner(&state.config, binding.as_ref())),
+        feishu_chat: binding
+            .as_ref()
+            .map(|binding| binding.chat_id.clone())
+            .unwrap_or_default(),
+        feishu_bound_unix: binding
+            .as_ref()
+            .map(|binding| binding.bound_unix)
+            .unwrap_or(0),
+        dry_run: state.config.feishu.control.dry_run,
+        agents,
+        online_window_secs: state.config.agent.offline_threshold_secs.max(30),
+        now: now_unix(),
+    }
+}
+
+/// Recipient shown by `--whoami`: config wins, then the binding file.
+fn binding_owner(config: &Config, binding: Option<&crate::feishu_control::Binding>) -> String {
+    let configured = config.feishu.app.owner_open_id.trim();
+    if !configured.is_empty() {
+        configured.to_string()
+    } else {
+        binding
+            .map(|binding| binding.open_id.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Short `cli_aa7a…9bfe` form for app ids and open ids in chat replies.
+fn mask_id(value: &str) -> String {
+    let chars: Vec<char> = value.trim().chars().collect();
+    if chars.len() <= 10 {
+        return value.trim().to_string();
+    }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}…{tail}")
 }
 
 async fn knock_listener(
