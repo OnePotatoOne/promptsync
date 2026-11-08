@@ -114,9 +114,7 @@ pub struct FeishuControlConfig {
     pub max_message_bytes: usize,
     /// Log what would happen without writing files (for a first trial run).
     pub dry_run: bool,
-    /// How long to wait for the "scan and send a message" binding step.
-    pub bind_timeout_secs: u64,
-    /// Optional Feishu email/phone used by the fallback binding path.
+    /// Optional Feishu email/phone that pins the alert recipient.
     pub bind_contact: String,
     /// How many `<file>.<stamp>.bak` backups to keep (0 = keep all).
     pub keep_backups: usize,
@@ -235,7 +233,6 @@ impl Default for FeishuControlConfig {
             poll_secs: 5,
             max_message_bytes: 32 * 1024,
             dry_run: false,
-            bind_timeout_secs: 90,
             bind_contact: String::new(),
             keep_backups: 50,
         }

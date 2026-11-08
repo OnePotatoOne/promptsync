@@ -297,8 +297,8 @@ async fn send_bye(channel: &mut Channel, agent_id: &str) {
 /// Copy the server's Feishu recipient when both sides use the same app.
 ///
 /// Feishu open_ids are app-scoped, so this is only valid when the app id
-/// matches. The agent still falls back to its own one-time-code binding loop
-/// when the app differs or the server has no recipient yet.
+/// matches. The agent still falls back to its own automatic binding loop (app
+/// owner) when the app differs or the server has no recipient yet.
 fn adopt_feishu_owner(
     config: &Config,
     manifest: &crate::proto::Manifest,
@@ -596,9 +596,9 @@ fn spawn_feishu(
     feishu::spawn_notify(&config, logger, text);
 }
 
-/// Start the background one-time-code binding loop when the agent has no
-/// recipient yet. The task keeps running after startup, unlike the wizard's
-/// short wait, and updates the shared owner cell as soon as it binds.
+/// Start the background binding loop when the agent has no recipient yet.
+/// Binding is automatic (the app owner is resolved and messaged once), so this
+/// only retries transient failures and updates the shared owner cell.
 fn spawn_feishu_binding(
     config: &Config,
     logger: &Logger,

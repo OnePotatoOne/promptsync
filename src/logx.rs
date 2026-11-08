@@ -71,8 +71,8 @@ impl Logger {
         let file = options
             .open(&path)
             .with_context(|| format!("opening log file {}", path.display()))?;
-        // Logs may contain one-time Feishu binding codes: keep them private,
-        // even when the file already existed with a looser mode.
+        // Logs carry agent ids and Feishu recipients: keep them private, even
+        // when the file already existed with a looser mode.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -222,7 +222,7 @@ pub async fn run(
                         ));
                     } else {
                         logger.info(
-                            "Feishu: 尚未绑定；请查看随后日志中的一次性绑定码，并从授权账号的私聊发送",
+                            "Feishu: 尚未绑定；正在自动识别接收人（应用所有者）并绑定，不需要你发消息",
                         );
                     }
                     let config = state.config.clone();

@@ -15,13 +15,6 @@ use crate::config::{Config, FeishuAppConfig};
 use crate::logx::Logger;
 
 #[derive(Debug, Clone)]
-pub struct ChatInfo {
-    pub chat_id: String,
-    pub mode: String,
-    pub name: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct Message {
     pub id: String,
     pub create_time_ms: u64,
@@ -169,58 +162,6 @@ impl FeishuClient {
         self.send_text_to("open_id", open_id, text)
     }
 
-    /// Chats the app/bot belongs to. Feishu may or may not include private
-    /// (p2p) chats here; the binding flow handles both cases.
-    pub fn list_chats(&self) -> Result<Vec<ChatInfo>> {
-        let token = self.tenant_token()?;
-        let mut chats = Vec::new();
-        let mut page_token: Option<String> = None;
-        loop {
-            let mut path = String::from("/open-apis/im/v1/chats?page_size=50&user_id_type=open_id");
-            if let Some(page) = page_token.as_deref() {
-                if !page.is_empty() {
-                    path.push_str("&page_token=");
-                    path.push_str(page);
-                }
-            }
-            let value = self.get_json(&path, Some(&token))?;
-            let data = value.get("data").cloned().unwrap_or(Value::Null);
-            if let Some(items) = data.get("items").and_then(Value::as_array) {
-                for item in items {
-                    chats.push(ChatInfo {
-                        chat_id: item
-                            .get("chat_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        mode: item
-                            .get("chat_mode")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        name: item
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                    });
-                }
-            }
-            let has_more = data
-                .get("has_more")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            page_token = data
-                .get("page_token")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            if !has_more || page_token.is_none() {
-                break;
-            }
-        }
-        Ok(chats)
-    }
-
     /// Messages in one chat with `create_time` in the given (second) range.
     pub fn list_messages(
         &self,
@@ -334,6 +275,32 @@ impl FeishuClient {
             }
         }
         bail!("Feishu could not resolve {contact} to an open_id (check the contact permission)")
+    }
+
+    /// The account that owns this app, as an open_id in this app's namespace.
+    ///
+    /// Feishu exposes the app's own `owner.owner_id` (and `creator_id`) to the
+    /// app itself with a tenant token, so the alert recipient can be resolved
+    /// automatically: nobody has to message the bot first.
+    pub fn app_owner_open_id(&self) -> Result<String> {
+        let token = self.tenant_token()?;
+        let path = format!(
+            "/open-apis/application/v6/applications/{}?lang=zh_cn",
+            self.app_id
+        );
+        let value = self.get_json(&path, Some(&token))?;
+        let app = value.pointer("/data/app").cloned().unwrap_or(Value::Null);
+        for pointer in ["/owner/owner_id", "/creator_id"] {
+            if let Some(id) = app.pointer(pointer).and_then(Value::as_str) {
+                if !id.is_empty() {
+                    return Ok(id.to_string());
+                }
+            }
+        }
+        bail!(
+            "Feishu returned no owner for app {} (needs application:application:self_manage on a published app)",
+            self.app_id
+        )
     }
 
     fn post_json(&self, path: &str, token: Option<&str>, body: &Value) -> Result<Value> {

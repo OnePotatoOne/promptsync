@@ -152,8 +152,6 @@ pub fn parse_choice(value: &str, count: usize) -> Option<usize> {
 pub struct PrepareOptions {
     /// The config file was created from the template on this start.
     pub created: bool,
-    /// A fresh cluster secret was generated and has not been shown yet.
-    pub secret_generated: bool,
     /// `--configure`: run the wizard even when the config already exists.
     pub force_wizard: bool,
 }
@@ -174,7 +172,6 @@ pub fn prepare(
 ) -> Result<Option<Config>> {
     let PrepareOptions {
         created,
-        secret_generated,
         force_wizard,
     } = options;
     if !prompter.enabled() {
@@ -210,7 +207,7 @@ pub fn prepare(
     }
     let (reloaded, _) = paths.load()?;
     config = reloaded;
-    print_summary(&config, paths, role, secret_generated);
+    print_summary(&config, paths, role);
     Ok(Some(config))
 }
 
@@ -224,7 +221,7 @@ fn feishu_state_text(config: &Config) -> String {
     }
     let owner = config.feishu.app.owner_open_id.trim();
     if owner.is_empty() {
-        "已启用，接收人启动后自动绑定/继承".to_string()
+        "已启用，接收人自动识别（应用所有者）".to_string()
     } else {
         format!("已启用，接收人 {}", mask_id(owner))
     }
@@ -446,12 +443,18 @@ fn offer_starter_target(config: &mut Config, paths: &Paths, prompter: &Prompter)
 
 fn configure_secret(config: &mut Config, paths: &Paths, prompter: &Prompter) -> Result<()> {
     let secret = ClusterSecret::resolve(&config.cluster_secret)?;
+    // Printed in full (not just the fingerprint) so it can be copied straight
+    // to the other machine without opening config.toml.
     println!(
-        "当前集群密钥指纹 {}（已保存在 {}）。",
+        "当前集群密钥（复制下面这串到其他机器）：\n\n   {}\n",
+        secret.to_hex()
+    );
+    println!(
+        "指纹 {}；已保存在 {}。",
         secret.fingerprint(),
         paths.config_file.display()
     );
-    println!("输入所有机器共用的同一句口令；直接回车保留当前随机密钥：");
+    println!("输入所有机器共用的同一句口令；直接回车保留上面这把：");
     loop {
         let value = prompter.text("集群口令", "");
         if value.trim().is_empty() {
@@ -467,10 +470,11 @@ fn configure_secret(config: &mut Config, paths: &Paths, prompter: &Prompter) -> 
                 )?;
                 config.cluster_secret = secret.to_hex();
                 println!(
-                    "已更新，指纹 {}；之前打印的初始随机密钥已作废，请以这个值为准。",
-                    secret.fingerprint()
+                    "已更新，新密钥（复制这串到其他机器）：\n\n   {}\n\n指纹 {}；已写入 {}",
+                    secret.to_hex(),
+                    secret.fingerprint(),
+                    paths.config_file.display()
                 );
-                println!("这个值已写入 {}。", paths.config_file.display());
                 return Ok(());
             }
             Err(err) => eprintln!("口令无效：{err}"),
@@ -504,7 +508,7 @@ fn configure_feishu(
     if has_app {
         println!("已配置应用 {}。", mask_id(config.feishu.app.app_id.trim()));
         if prompter.confirm("继续使用这个应用？", true) {
-            return finish_feishu(config, paths, prompter, logger, role);
+            return finish_feishu(config, paths, logger, role);
         }
     }
 
@@ -540,7 +544,7 @@ fn configure_feishu(
             return Ok(());
         }
     }
-    finish_feishu(config, paths, prompter, logger, role)
+    finish_feishu(config, paths, logger, role)
 }
 
 /// Short safe rendering of an app id for prompts/logs.
@@ -637,7 +641,7 @@ fn manual_feishu_credentials(
             "应用需要机器人能力和 im:message:readonly、im:message:send_as_bot、im:chat:readonly 权限。"
         ),
         Role::Agent => println!(
-            "应用至少需要 im:message:send_as_bot；扫码绑定还需要 im:message:readonly、im:chat:readonly。"
+            "应用至少需要 im:message:send_as_bot（自动绑定只发一条消息，不需要读权限）。"
         ),
     }
     loop {
@@ -668,13 +672,7 @@ fn manual_feishu_credentials(
     }
 }
 
-fn finish_feishu(
-    config: &mut Config,
-    paths: &Paths,
-    prompter: &Prompter,
-    logger: &Logger,
-    role: Role,
-) -> Result<()> {
+fn finish_feishu(config: &mut Config, paths: &Paths, logger: &Logger, role: Role) -> Result<()> {
     print!("校验凭据 … ");
     let _ = io::stdout().flush();
     match FeishuClient::from_config(config).and_then(|client| client.check()) {
@@ -698,75 +696,34 @@ fn finish_feishu(
             Err(err) => println!("自动识别 sync.target 失败：{err:#}"),
         }
     }
-    // Some tenants do not return p2p chats through the chat-list API, and
-    // send-only apps cannot read messages at all. A configured recipient works
-    // in both cases, so offer direct binding before trying QR discovery.
-    if config.feishu.app.owner_open_id.trim().is_empty() {
-        if role == Role::Agent {
-            // The agent inherits the server's recipient from the manifest when
-            // both use the same app; otherwise the runtime binding loop takes
-            // over. Asking for an open_id here only added a prompt.
-            println!(
-                "告警接收人：同一个 app 时从服务端自动继承；app 不同时启动后按日志里的绑定码绑定，无需填写。"
-            );
-        } else {
-            let owner = prompter.text(
-                "授权账号 open_id（一键创建会自动带；留空则启动后用一次性绑定码）",
-                "",
-            );
-            if owner.trim().is_empty() {
-                println!("部分租户不会返回机器人私聊；绑定码无响应时可重新运行并填写 open_id。");
-            } else {
-                apply(
-                    paths,
-                    Some("feishu.app"),
-                    "owner_open_id",
-                    &toml_string(owner.trim()),
-                )?;
-                config.feishu.app.owner_open_id = owner.trim().to_string();
-            }
-        }
-    }
-    // The agent has no control channel: with no recipient configured it simply
-    // inherits the server's (same app) or binds from the background loop after
-    // startup. Waiting here for a one-time code would block the wizard.
-    if role == Role::Agent && config.feishu.app.owner_open_id.trim().is_empty() {
-        return Ok(());
-    }
+    // Binding is fully automatic: the recipient is the app owner (or whatever
+    // `owner_open_id` pins) and the chat id comes back from the send itself, so
+    // the wizard never asks the user to send a message from Feishu.
     let purpose = match role {
         Role::Server => feishu_control::BindingPurpose::Server,
         Role::Agent => feishu_control::BindingPurpose::Agent,
     };
-    match feishu_control::ensure_binding(config, paths, prompter, logger, true, purpose) {
+    match feishu_control::ensure_binding(config, paths, logger, true, purpose) {
         Ok(Some(binding)) => match role {
             Role::Server => println!(
-                "飞书绑定完成：open_id {}（之后直接在这个私聊里发纯文本即可）。",
+                "飞书已自动绑定：接收人 open_id {}（确认消息已发送，之后直接在这个私聊里发纯文本即可）。",
                 binding.open_id
             ),
-            Role::Agent => {
-                println!("飞书告警已连接：open_id {}。", binding.open_id)
-            }
+            Role::Agent => println!(
+                "飞书告警已自动绑定：接收人 open_id {}（确认消息已发送）。",
+                binding.open_id
+            ),
         },
-        Ok(None) => match role {
-            Role::Server => {
-                println!("飞书还没完成绑定；服务启动后会在日志中给出一次性绑定码，请从授权账号的私聊发送。")
-            }
-            Role::Agent => {
-                println!("飞书还没完成绑定；离线告警暂不会发送。");
-                println!(
-                    "如果应用只有 im:message:send_as_bot 权限，请在 config.toml 的 [feishu.app] 手动填写 owner_open_id（服务端 status --json 可查）。"
-                );
-            }
-        },
-        Err(err) => match role {
-            Role::Server => println!("飞书绑定失败：{err:#}。服务启动后仍会自动重试。"),
-            Role::Agent => println!("飞书告警绑定失败：{err:#}。可重新运行 agent 再配置。"),
-        },
+        Ok(None) => {
+            println!("飞书已启用，但这次没能自动绑定；启动后会继续自动重试，不会让你去发绑定码。");
+            println!("要指定别人接收，可在 config.toml 的 [feishu.app] 填写 owner_open_id。");
+        }
+        Err(err) => println!("飞书绑定失败：{err:#}。启动后会自动重试。"),
     }
     Ok(())
 }
 
-fn print_summary(config: &Config, paths: &Paths, role: Role, show_secret: bool) {
+fn print_summary(config: &Config, paths: &Paths, role: Role) {
     let secret = ClusterSecret::resolve(&config.cluster_secret).ok();
     let server_endpoints = secret
         .as_ref()
@@ -785,22 +742,15 @@ fn print_summary(config: &Config, paths: &Paths, role: Role, show_secret: bool) 
     println!("日志目录     {}", paths.log_dir(config).display());
 
     if let Some(secret) = &secret {
-        if show_secret {
-            println!("集群密钥     {}", secret.to_hex());
-            println!(
-                "密钥位置     {} -> cluster_secret",
-                paths.config_file.display()
-            );
-            println!("             这串密钥只在本终端显示，请保存好再继续；不要发到公开群。");
-        } else {
-            println!("集群密钥     已保存（指纹 {}）", secret.fingerprint());
-            println!(
-                "密钥位置     {} -> cluster_secret",
-                paths.config_file.display()
-            );
-            println!("             查看：promptsync secret --show");
-        }
+        // Always print the secret itself: it is the value that has to be copied
+        // to the other machines, and hunting for it in config.toml is busywork.
+        println!("集群密钥     {}", secret.to_hex());
+        println!(
+            "密钥位置     {} -> cluster_secret",
+            paths.config_file.display()
+        );
         println!("密钥指纹     {}", secret.fingerprint());
+        println!("             复制上面这串到其他机器；不要发到公开群或提交到 git。");
     } else {
         println!("集群密钥     无法解析，请重新运行并检查 cluster_secret");
     }
@@ -926,7 +876,7 @@ fn print_summary(config: &Config, paths: &Paths, role: Role, show_secret: bool) 
             println!(
                 "告警接收人   {}",
                 if owner.is_empty() {
-                    "启动后自动继承/绑定".to_string()
+                    "自动识别（应用所有者）".to_string()
                 } else {
                     mask_id(owner)
                 }
@@ -937,16 +887,13 @@ fn print_summary(config: &Config, paths: &Paths, role: Role, show_secret: bool) 
     println!();
     match role {
         Role::Server => {
-            println!("下一步       其他机器首次启动时，在集群密钥步骤粘贴上面的集群密钥；");
+            println!("下一步       其他机器首次启动时，在集群密钥步骤粘贴上面那串密钥；");
             println!("             或运行 promptsync secret --set \"<这串密钥>\"。");
         }
         Role::Agent => {
-            println!("下一步       确认上面的密钥指纹与 server 一致；不一致就重新运行");
-            println!("             promptsync agent，在集群密钥步骤粘贴 server 的密钥。");
+            println!("下一步       确认上面的密钥与服务端一致；不一致就重新运行");
+            println!("             promptsync agent，在集群密钥步骤粘贴服务端那串。");
         }
-    }
-    if !show_secret {
-        println!("             查看完整密钥：promptsync secret --show");
     }
     println!(
         "改配置       编辑 {}，或重新运行 `promptsync {} --configure`",

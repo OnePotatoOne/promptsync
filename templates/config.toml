@@ -80,9 +80,7 @@ poll_secs = 5
 max_message_bytes = 32768
 # 只记录不写入，用于第一次试运行
 dry_run = false
-# 扫码后等待私聊消息的秒数，超时则回退到邮箱/手机号绑定
-bind_timeout_secs = 90
-# 可选的飞书邮箱/手机号（bind_timeout 后的回退绑定）
+# 可选的接收人（飞书邮箱/手机号）；留空 = 自动用应用所有者
 bind_contact = ""
 # 覆盖时保留多少个 <文件名>.<时间>.bak 备份；0 = 全部保留
 keep_backups = 50

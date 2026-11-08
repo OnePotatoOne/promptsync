@@ -2,7 +2,6 @@
 //! private-chat text messages into the one managed prompt file.
 
 use anyhow::{bail, Context, Result};
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -13,7 +12,6 @@ use std::time::{Duration, Instant};
 use crate::config::{set_source_globs, set_value, Config};
 use crate::feishu::{self, message_text, FeishuClient};
 use crate::globpat;
-use crate::interactive::Prompter;
 use crate::logx::Logger;
 use crate::paths::Paths;
 use crate::prompts::SourceSpec;
@@ -214,39 +212,92 @@ pub enum BindingPurpose {
     Agent,
 }
 
-const BINDING_CHALLENGE_TTL_SECS: u64 = 900;
-
-#[derive(Clone)]
-struct BindingChallenge {
-    code: String,
-    started_unix: u64,
+/// Where the message recipient came from. Reported in the log so an unexpected
+/// recipient is one grep away from the config value that caused it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerSource {
+    Configured,
+    Contact,
+    AppOwner,
 }
 
-impl BindingChallenge {
-    fn new() -> Self {
-        let mut random = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut random);
-        Self {
-            code: format!("PSYNC-{}", hex::encode(random)),
-            started_unix: now_unix(),
+impl OwnerSource {
+    fn label(self) -> &'static str {
+        match self {
+            OwnerSource::Configured => "configured owner_open_id",
+            OwnerSource::Contact => "bind_contact",
+            OwnerSource::AppOwner => "app owner",
         }
     }
+}
 
-    fn expired(&self, now: u64) -> bool {
-        now.saturating_sub(self.started_unix) > BINDING_CHALLENGE_TTL_SECS
+impl BindingPurpose {
+    /// The one message the bot sends while binding. Its response carries the
+    /// private chat id, so binding and confirming are the same API call and
+    /// nothing has to be answered by hand.
+    fn success_message(self) -> &'static str {
+        match self {
+            BindingPurpose::Server => {
+                "promptsync 绑定成功。以后直接把纯文本 prompt 发给我，我会覆盖服务端的那个文件。"
+            }
+            BindingPurpose::Agent => "promptsync agent 绑定成功。之后离线告警会发到这个私聊。",
+        }
     }
 }
 
-/// First-start binding.
+/// Resolve who receives messages without asking anyone to send one:
+/// an explicitly configured recipient wins, then a configured email/mobile,
+/// then the account that owns the app.
+pub fn resolve_owner(config: &Config, client: &FeishuClient) -> Result<(String, OwnerSource)> {
+    let configured = config.feishu.app.owner_open_id.trim();
+    if !configured.is_empty() {
+        return Ok((configured.to_string(), OwnerSource::Configured));
+    }
+    let contact = config.feishu.control.bind_contact.trim();
+    if !contact.is_empty() {
+        let open_id = if contact.starts_with("ou_") {
+            contact.to_string()
+        } else {
+            client.lookup_open_id(contact)?
+        };
+        return Ok((open_id, OwnerSource::Contact));
+    }
+    Ok((client.app_owner_open_id()?, OwnerSource::AppOwner))
+}
+
+/// Message the recipient and learn the private chat id from the response. That
+/// is the whole binding step: no one-time code, nothing for the user to send,
+/// and the same code path for both roles.
+fn bind_once(
+    config: &Config,
+    client: &FeishuClient,
+    message: &str,
+) -> Result<(Binding, OwnerSource)> {
+    let (open_id, source) = resolve_owner(config, client)?;
+    let sent = client.send_text_to_owner(&open_id, message)?;
+    let binding = checked_binding(
+        config,
+        Binding {
+            chat_id: sent.chat_id,
+            open_id,
+            app_id: config.feishu.app.app_id.trim().to_string(),
+            bound_unix: now_unix(),
+        },
+    )?;
+    Ok((binding, source))
+}
+
+/// First-start binding, fully automatic.
 ///
-/// Order of attempts:
-/// 1. `owner_open_id` already configured: ping the owner, learn the chat id.
-/// 2. QR/link + a fresh one-time code, then discover the authorised p2p chat.
-/// 3. Fall back to a Feishu email/mobile (`feishu.control.bind_contact` or a prompt).
+/// 1. A binding on disk that still matches the app/owner is reused.
+/// 2. Otherwise the recipient is resolved (config, `bind_contact`, then the app
+///    owner) and messaged once; the response carries the private chat id.
+///
+/// Nothing waits for a message from a human, so the wizard and the background
+/// retry loop share the same code path.
 pub fn ensure_binding(
     config: &mut Config,
     paths: &Paths,
-    prompter: &Prompter,
     logger: &Logger,
     force: bool,
     purpose: BindingPurpose,
@@ -260,20 +311,6 @@ pub fn ensure_binding(
         );
         return Ok(None);
     }
-    let (check_message, success_message, heading, rerun_command) = match purpose {
-        BindingPurpose::Server => (
-            "promptsync：绑定检查，稍后你就可以直接发 prompt 了。",
-            "promptsync 绑定成功。以后直接把纯文本 prompt 发给我，我会覆盖服务端的那个文件。",
-            "=== 绑定飞书机器人 ===",
-            "promptsync server",
-        ),
-        BindingPurpose::Agent => (
-            "promptsync agent：告警绑定检查，稍后离线告警会发到这里。",
-            "promptsync agent 绑定成功。之后离线告警会发到这个私聊。",
-            "=== 绑定飞书告警 ===",
-            "promptsync agent",
-        ),
-    };
     let data_dir = paths.data_dir();
     fs::create_dir_all(&data_dir)?;
     if !force {
@@ -286,157 +323,28 @@ pub fn ensure_binding(
 
     let client = FeishuClient::from_config(config)?;
     client.check().context("verifying Feishu app credentials")?;
-
-    // 1. owner_open_id configured manually: send a message to learn the chat id.
-    let configured_owner = config.feishu.app.owner_open_id.trim().to_string();
-    if !configured_owner.is_empty() {
-        let sent = client
-            .send_text_to_owner(&configured_owner, check_message)
-            .context("sending the binding check message")?;
-        let binding = checked_binding(
-            config,
-            Binding {
-                chat_id: sent.chat_id,
-                open_id: configured_owner,
-                app_id: config.feishu.app.app_id.trim().to_string(),
-                bound_unix: now_unix(),
-            },
-        )?;
-        save_binding(&data_dir, &binding)?;
-        logger.info(format!(
-            "Feishu bound via configured owner_open_id (chat {})",
-            binding.chat_id
-        ));
-        return Ok(Some(binding));
-    }
-
-    let app_link = format!(
-        "https://applink.feishu.cn/client/bot/open?appId={}",
-        config.feishu.app.app_id.trim()
-    );
-
-    let challenge = BindingChallenge::new();
-    if !prompter.enabled() {
-        logger.warn(format!(
-            "Feishu app is not bound. To authorise a specific account, send the one-time code {} from that account's private chat, then re-run `{rerun_command}`. You can also configure feishu.app.owner_open_id explicitly. {app_link}",
-            challenge.code
-        ));
-        return Ok(None);
-    }
-
-    println!("\n{heading}");
-    println!("1) 用飞书扫描下面的二维码，或直接打开链接：\n   {app_link}\n");
-    print_qr(&app_link);
-    println!(
-        "2) 用需要授权的账号，在机器人私聊里只发送下面这个一次性绑定码：\n\n   {}\n",
-        challenge.code
-    );
-    println!("   绑定码 15 分钟内有效；普通私聊消息不会再自动获得控制权。");
-    println!(
-        "3) 最多等待 {} 秒，检测到绑定码后会自动完成绑定\n",
-        config.feishu.control.bind_timeout_secs.max(15)
-    );
-
-    let deadline =
-        Instant::now() + Duration::from_secs(config.feishu.control.bind_timeout_secs.max(15));
-    let mut last_error: Option<String> = None;
-    let discovery_started = Instant::now();
-    let mut showed_discovery_hint = false;
-    while Instant::now() < deadline {
-        match discover_p2p_binding(&client, &challenge) {
-            Ok(Some(binding)) => {
-                let binding = match checked_binding(config, binding) {
-                    Ok(binding) => binding,
-                    Err(err) => {
-                        logger.warn(format!("Feishu binding rejected: {err:#}"));
-                        continue;
-                    }
-                };
-                save_binding(&data_dir, &binding)?;
-                set_value(
-                    &paths.config_file,
-                    Some("feishu.app"),
-                    "owner_open_id",
-                    &format!("\"{}\"", binding.open_id),
-                )?;
-                // Keep the in-memory copy in step with the file so callers can
-                // print what was just learned without re-reading the config.
-                config.feishu.app.owner_open_id = binding.open_id.clone();
-                let _ = client.send_text_to_chat(&binding.chat_id, success_message);
-                logger.info(format!(
-                    "Feishu bound: chat {} owner {}",
-                    binding.chat_id, binding.open_id
-                ));
-                return Ok(Some(binding));
-            }
-            Ok(None) => {
-                if !showed_discovery_hint && discovery_started.elapsed() >= Duration::from_secs(10)
-                {
-                    println!("还没有发现绑定码。部分租户不会返回机器人私聊；等待结束后可直接输入 open_id 绑定。");
-                    showed_discovery_hint = true;
-                }
-            }
-            Err(err) => {
-                let message = format!("{err:#}");
-                logger.warn(format!("Feishu binding poll failed: {message}"));
-                if last_error.as_deref() != Some(&message) {
-                    println!("绑定轮询失败：{message}");
-                    println!("请检查 im:message:readonly / im:chat:readonly 权限；也可以等待结束后直接输入 open_id。");
-                    last_error = Some(message);
-                }
-            }
+    match bind_once(config, &client, purpose.success_message()) {
+        Ok((binding, source)) => {
+            store_binding(&data_dir, &paths.config_file, &binding)?;
+            // Keep the in-memory copy in step with the file so callers can
+            // print what was just learned without re-reading the config.
+            config.feishu.app.owner_open_id = binding.open_id.clone();
+            logger.info(format!(
+                "Feishu bound ({}): chat {} owner {}",
+                source.label(),
+                binding.chat_id,
+                binding.open_id
+            ));
+            Ok(Some(binding))
         }
-        std::thread::sleep(Duration::from_secs(2));
-    }
-
-    let contact = {
-        let configured = config.feishu.control.bind_contact.trim().to_string();
-        if configured.is_empty() {
-            prompter.text(
-                "未检测到绑定码。输入授权账号的 open_id、飞书邮箱或手机号直接绑定（留空取消）",
-                "",
-            )
-        } else {
-            configured
+        Err(err) => {
+            logger.warn(format!(
+                "Feishu 自动绑定失败：{err:#}；可在 config.toml 的 [feishu.app] 填写 owner_open_id 指定接收人"
+            ));
+            Ok(None)
         }
-    };
-    if contact.trim().is_empty() {
-        logger.warn("Feishu binding cancelled");
-        return Ok(None);
     }
-    let open_id = if contact.trim().starts_with("ou_") {
-        contact.trim().to_string()
-    } else {
-        client
-            .lookup_open_id(contact.trim())
-            .context("resolving the Feishu account")?
-    };
-    let sent = client
-        .send_text_to_owner(&open_id, success_message)
-        .context("sending the binding message")?;
-    let binding = checked_binding(
-        config,
-        Binding {
-            chat_id: sent.chat_id,
-            open_id: open_id.clone(),
-            app_id: config.feishu.app.app_id.trim().to_string(),
-            bound_unix: now_unix(),
-        },
-    )?;
-    save_binding(&data_dir, &binding)?;
-    set_value(
-        &paths.config_file,
-        Some("feishu.app"),
-        "owner_open_id",
-        &format!("\"{open_id}\""),
-    )?;
-    logger.info(format!(
-        "Feishu bound via contact lookup: chat {} owner {open_id}",
-        binding.chat_id
-    ));
-    Ok(Some(binding))
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetCandidate {
     pub key: String,
@@ -560,46 +468,6 @@ pub fn print_qr(link: &str) {
     }
 }
 
-/// Look for the one-time code in a private chat created after this flow began.
-/// A historical or ordinary private message must never grant prompt control.
-fn discover_p2p_binding(
-    client: &FeishuClient,
-    challenge: &BindingChallenge,
-) -> Result<Option<Binding>> {
-    let now = now_unix();
-    if challenge.expired(now) {
-        return Ok(None);
-    }
-    for chat in client.list_chats()? {
-        if chat.mode != "p2p" {
-            continue;
-        }
-        let messages = client.list_messages(
-            &chat.chat_id,
-            challenge.started_unix.saturating_sub(1),
-            now + 60,
-        )?;
-        for message in messages.iter().rev() {
-            if message.create_time_ms / 1000 < challenge.started_unix {
-                continue;
-            }
-            if message.sender_type != "user" || message.sender_id.is_empty() {
-                continue;
-            }
-            if message_text(message).as_deref().map(str::trim) != Some(challenge.code.as_str()) {
-                continue;
-            }
-            return Ok(Some(Binding {
-                chat_id: chat.chat_id.clone(),
-                open_id: message.sender_id.clone(),
-                app_id: client.app_id().to_string(),
-                bound_unix: now,
-            }));
-        }
-    }
-    Ok(None)
-}
-
 /// Ingest loop (runs on the server).
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -700,77 +568,9 @@ fn store_binding(data_dir: &Path, config_file: &Path, binding: &Binding) -> Resu
     Ok(())
 }
 
-/// A configured Feishu email/mobile is the most reliable fallback when the
-/// tenant does not expose p2p chats: resolve it once, message the account and
-/// learn the chat id from the response.
-async fn try_contact_binding(
-    config: &Config,
-    client: &Arc<FeishuClient>,
-    logger: &Logger,
-    success_message: &str,
-) -> Option<Binding> {
-    let contact = config.feishu.control.bind_contact.trim().to_string();
-    if contact.is_empty() {
-        return None;
-    }
-    let config = config.clone();
-    let client = Arc::clone(client);
-    let message = success_message.to_string();
-    let label = contact.clone();
-    match tokio::task::spawn_blocking(move || {
-        bind_via_contact(&config, &client, &contact, &message)
-    })
-    .await
-    {
-        Ok(Ok(binding)) => Some(binding),
-        Ok(Err(err)) => {
-            logger.warn(format!(
-                "Feishu bind_contact {label:?} failed: {err:#}; falling back to the one-time code"
-            ));
-            None
-        }
-        Err(err) => {
-            logger.warn(format!("Feishu bind_contact task panicked: {err}"));
-            None
-        }
-    }
-}
-
-/// Resolve an open_id or a Feishu email/mobile, message the account and learn
-/// the private chat id from the send response.
-fn bind_via_contact(
-    config: &Config,
-    client: &FeishuClient,
-    contact: &str,
-    message: &str,
-) -> Result<Binding> {
-    let contact = contact.trim();
-    if contact.is_empty() {
-        bail!("feishu.control.bind_contact is empty");
-    }
-    let open_id = if contact.starts_with("ou_") {
-        contact.to_string()
-    } else {
-        client.lookup_open_id(contact)?
-    };
-    let sent = client.send_text_to_owner(&open_id, message)?;
-    checked_binding(
-        config,
-        Binding {
-            chat_id: sent.chat_id,
-            open_id,
-            app_id: config.feishu.app.app_id.trim().to_string(),
-            bound_unix: now_unix(),
-        },
-    )
-}
-
-/// Wait for the one-time binding code and persist the binding.
-///
-/// Both roles use the same private-chat discovery: the server needs the chat
-/// for prompt control, while an agent only needs the owner open_id for alerts.
-/// Running this as a background task means a code sent after startup is still
-/// processed (the wizard's short wait is not the only chance to bind).
+/// Background binding used by both roles: retry the automatic binding until it
+/// works (network hiccup, app just created, ...) and log each distinct error
+/// once instead of on every attempt.
 async fn bind_loop(
     config: &Config,
     client: &Arc<FeishuClient>,
@@ -780,78 +580,30 @@ async fn bind_loop(
     logger: &Logger,
     purpose: BindingPurpose,
 ) -> Result<Binding> {
-    let success_message = match purpose {
-        BindingPurpose::Server => {
-            "promptsync 绑定成功。以后直接把纯文本 prompt 发给我，我会覆盖服务端的那个文件。"
-        }
-        BindingPurpose::Agent => "promptsync agent 绑定成功。之后离线告警会发到这个私聊。",
-    };
-    let mut challenge = BindingChallenge::new();
-    if let Some(binding) = try_contact_binding(config, client, logger, success_message).await {
-        store_binding(data_dir, config_file, &binding)?;
-        logger.info(format!(
-            "Feishu bound via bind_contact: chat {} owner {}",
-            binding.chat_id, binding.open_id
-        ));
-        return Ok(binding);
-    }
-    logger.info(format!(
-        "Feishu: 尚未绑定。请用需要授权的账号在机器人私聊中只发送一次性绑定码 {}（15 分钟内有效）；发送普通消息不会获得控制权",
-        challenge.code
-    ));
-    println!(
-        "\n[promptsync] 飞书未绑定：请用授权账号在机器人私聊里只发送一次性绑定码 {}\n",
-        challenge.code
-    );
-    logger.warn(
-        "如果发送绑定码后没有反应，说明当前租户可能不返回 p2p 私聊，或应用缺少 im:message:readonly / im:chat:readonly 权限；可改为在 config.toml 的 [feishu.app] 填写 owner_open_id",
-    );
+    let message = purpose.success_message();
     let mut last_error: Option<String> = None;
     loop {
-        if challenge.expired(now_unix()) {
-            challenge = BindingChallenge::new();
-            logger.info(format!("Feishu 绑定码已更新：{}", challenge.code));
-            println!("\n[promptsync] 新的飞书一次性绑定码：{}\n", challenge.code);
-        }
         let task_config = config.clone();
         let client_for_task = Arc::clone(client);
-        let attempt = {
-            let challenge = challenge.clone();
-            tokio::task::spawn_blocking(move || {
-                try_bind_once(&task_config, &client_for_task, &challenge)
-            })
-            .await
-        };
+        let attempt =
+            tokio::task::spawn_blocking(move || bind_once(&task_config, &client_for_task, message))
+                .await;
         match attempt {
-            Ok(Ok(Some(binding))) => {
-                let binding = match checked_binding(config, binding) {
-                    Ok(binding) => binding,
-                    Err(err) => {
-                        let message = format!("{err:#}");
-                        if last_error.as_deref() != Some(&message) {
-                            logger.warn(format!("Feishu binding rejected: {message}"));
-                            last_error = Some(message);
-                        }
-                        tokio::time::sleep(Duration::from_secs(poll_secs)).await;
-                        continue;
-                    }
-                };
+            Ok(Ok((binding, source))) => {
                 store_binding(data_dir, config_file, &binding)?;
-                let _ = client.send_text_to_chat(&binding.chat_id, success_message);
                 logger.info(format!(
-                    "Feishu bound: chat {} owner {}",
-                    binding.chat_id, binding.open_id
+                    "Feishu bound ({}): chat {} owner {}",
+                    source.label(),
+                    binding.chat_id,
+                    binding.open_id
                 ));
                 return Ok(binding);
-            }
-            Ok(Ok(None)) => {
-                last_error = None;
             }
             Ok(Err(err)) => {
                 let message = format!("{err:#}");
                 if last_error.as_deref() != Some(&message) {
                     logger.warn(format!(
-                        "Feishu binding attempt failed (will keep trying): {message}"
+                        "Feishu 自动绑定失败（{poll_secs} 秒后重试）：{message}"
                     ));
                     last_error = Some(message);
                 }
@@ -862,8 +614,9 @@ async fn bind_loop(
     }
 }
 
-/// Background binding used by an agent. It keeps polling until a code arrives,
-/// then writes both `feishu-binding.json` and `feishu.app.owner_open_id`.
+/// Background binding used by an agent: it keeps retrying until the alert
+/// recipient is known, then writes both `feishu-binding.json` and
+/// `feishu.app.owner_open_id`.
 pub async fn bind_agent(
     config: &Config,
     data_dir: &Path,
@@ -882,32 +635,6 @@ pub async fn bind_agent(
         BindingPurpose::Agent,
     )
     .await
-}
-
-/// One binding attempt: a configured owner is pinged directly; otherwise we
-/// look for an existing p2p chat that already contains a user message.
-fn try_bind_once(
-    config: &Config,
-    client: &FeishuClient,
-    challenge: &BindingChallenge,
-) -> Result<Option<Binding>> {
-    let owner = config.feishu.app.owner_open_id.trim();
-    if !owner.is_empty() {
-        let sent = client.send_text_to_owner(
-            owner,
-            "promptsync 已就绪，之后直接在这个私聊里发纯文本即可。",
-        )?;
-        return Ok(Some(checked_binding(
-            config,
-            Binding {
-                chat_id: sent.chat_id,
-                open_id: owner.to_string(),
-                app_id: config.feishu.app.app_id.trim().to_string(),
-                bound_unix: now_unix(),
-            },
-        )?));
-    }
-    discover_p2p_binding(client, challenge)
 }
 
 struct PollOutcome {
@@ -1202,7 +929,6 @@ mod tests {
     struct MockFeishu {
         base: String,
         messages: Arc<Mutex<Vec<serde_json::Value>>>,
-        chats: Arc<Mutex<Vec<serde_json::Value>>>,
         sent: Arc<Mutex<Vec<String>>>,
     }
 
@@ -1211,9 +937,8 @@ mod tests {
             let server = Server::http("127.0.0.1:0").expect("mock server");
             let port = server.server_addr().to_ip().expect("ip addr").port();
             let messages = Arc::new(Mutex::new(Vec::new()));
-            let chats = Arc::new(Mutex::new(Vec::new()));
             let sent = Arc::new(Mutex::new(Vec::new()));
-            let (m, c, s) = (messages.clone(), chats.clone(), sent.clone());
+            let (m, s) = (messages.clone(), sent.clone());
             std::thread::spawn(move || {
                 for mut request in server.incoming_requests() {
                     let path = request.url().split('?').next().unwrap_or("").to_string();
@@ -1234,11 +959,20 @@ mod tests {
                             s.lock().unwrap().push(body);
                             json!({ "code": 0, "data": { "message_id": "ack-1", "chat_id": "oc_p2p" } })
                         }
-                        ("GET", "/open-apis/im/v1/chats") => {
-                            json!({ "code": 0, "data": { "items": *c.lock().unwrap(), "has_more": false } })
-                        }
                         ("POST", "/open-apis/contact/v3/users/batch_get_id") => {
                             json!({ "code": 0, "data": { "user_list": [ { "user_id": "ou_owner" } ] } })
+                        }
+                        ("GET", path)
+                            if path.starts_with("/open-apis/application/v6/applications/") =>
+                        {
+                            json!({
+                                "code": 0,
+                                "data": { "app": {
+                                    "app_id": "cli_test",
+                                    "creator_id": "ou_app_owner",
+                                    "owner": { "owner_id": "ou_app_owner", "type": 2 }
+                                }}
+                            })
                         }
                         _ => json!({ "code": 99999, "msg": "not mocked" }),
                     };
@@ -1251,7 +985,6 @@ mod tests {
             Self {
                 base: format!("http://127.0.0.1:{port}"),
                 messages,
-                chats,
                 sent,
             }
         }
@@ -1343,43 +1076,37 @@ mod tests {
     }
 
     #[test]
-    fn discovers_the_private_chat_and_skips_groups() {
+    fn binds_to_the_app_owner_without_any_message_from_the_user() {
         let mock = MockFeishu::start();
-        mock.chats.lock().unwrap().push(json!({
-            "chat_id": "oc_group", "chat_mode": "group", "name": "team"
-        }));
-        mock.chats.lock().unwrap().push(json!({
-            "chat_id": "oc_p2p", "chat_mode": "p2p", "name": ""
-        }));
-        let challenge = BindingChallenge::new();
-        mock.push_text("ordinary messages must not bind", "ou_someone");
-        mock.push_text(&challenge.code, "ou_owner");
         let mut config = Config::default();
         config.feishu.app.app_id = "cli_test".to_string();
         config.feishu.app.app_secret = "secret".to_string();
         config.feishu.app.api_base = mock.base.clone();
         let client = FeishuClient::new(&config.feishu.app, Duration::from_secs(5)).unwrap();
-        let binding = discover_p2p_binding(&client, &challenge)
-            .unwrap()
-            .expect("binding");
+
+        assert_eq!(client.app_owner_open_id().unwrap(), "ou_app_owner");
+        let (binding, source) = bind_once(&config, &client, "绑定成功").unwrap();
+        assert_eq!(source, OwnerSource::AppOwner);
+        assert_eq!(binding.open_id, "ou_app_owner");
         assert_eq!(binding.chat_id, "oc_p2p");
-        assert_eq!(binding.open_id, "ou_owner");
         assert_eq!(binding.app_id, "cli_test");
+        assert!(mock.acks().iter().any(|text| text == "绑定成功"));
+        // The user never had to send anything.
+        assert!(mock.messages.lock().unwrap().is_empty());
+    }
 
-        mock.messages.lock().unwrap().clear();
-        mock.push_text("PSYNC-wrong-code", "ou_someone");
-        assert!(discover_p2p_binding(&client, &challenge).unwrap().is_none());
-
-        mock.messages.lock().unwrap().clear();
-        mock.messages.lock().unwrap().push(json!({
-            "message_id": "old-code",
-            "create_time": ((challenge.started_unix - 10) * 1000).to_string(),
-            "msg_type": "text",
-            "body": { "content": json!({ "text": challenge.code }).to_string() },
-            "sender": { "id": "ou_someone", "sender_type": "user" },
-            "chat_id": "oc_p2p",
-        }));
-        assert!(discover_p2p_binding(&client, &challenge).unwrap().is_none());
+    #[test]
+    fn a_configured_recipient_wins_over_the_app_owner() {
+        let mock = MockFeishu::start();
+        let mut config = Config::default();
+        config.feishu.app.app_id = "cli_test".to_string();
+        config.feishu.app.app_secret = "secret".to_string();
+        config.feishu.app.api_base = mock.base.clone();
+        config.feishu.app.owner_open_id = "ou_configured".to_string();
+        let client = FeishuClient::new(&config.feishu.app, Duration::from_secs(5)).unwrap();
+        let (binding, source) = bind_once(&config, &client, "hi").unwrap();
+        assert_eq!(source, OwnerSource::Configured);
+        assert_eq!(binding.open_id, "ou_configured");
     }
 
     #[test]
@@ -1712,7 +1439,8 @@ mod tests {
         config.feishu.app.api_base = mock.base.clone();
         config.feishu.control.bind_contact = "owner@example.com".to_string();
         let client = FeishuClient::new(&config.feishu.app, Duration::from_secs(5)).unwrap();
-        let binding = bind_via_contact(&config, &client, "owner@example.com", "hello").unwrap();
+        let (binding, source) = bind_once(&config, &client, "hello").unwrap();
+        assert_eq!(source, OwnerSource::Contact);
         assert_eq!(binding.open_id, "ou_owner");
         assert_eq!(binding.chat_id, "oc_p2p");
         assert_eq!(binding.app_id, "cli_test");

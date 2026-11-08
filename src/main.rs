@@ -149,7 +149,7 @@ async fn dispatch(cli: Cli) -> Result<u8> {
     // First start (or an old config created before this feature) gets a random
     // cluster secret. Never fall back to a key compiled into the binary: that
     // would make every download of the public release share the same key.
-    let secret_generated = match &cli.command {
+    match &cli.command {
         Command::Server { .. } | Command::Agent { .. } => {
             ensure_cluster_secret(&paths, &mut config, false)?
         }
@@ -192,7 +192,6 @@ async fn dispatch(cli: Cli) -> Result<u8> {
                 &logger,
                 interactive::PrepareOptions {
                     created,
-                    secret_generated,
                     force_wizard: cli.configure,
                 },
             )? {
@@ -237,7 +236,6 @@ async fn dispatch(cli: Cli) -> Result<u8> {
                 &logger,
                 interactive::PrepareOptions {
                     created,
-                    secret_generated,
                     force_wizard: cli.configure,
                 },
             )? {
@@ -618,7 +616,7 @@ fn status(config: &Config, paths: &Paths, json: bool) -> Result<u8> {
             }
         );
     } else if config.feishu.enabled && config.feishu_app_configured() {
-        println!("feishu chat      -（未绑定：启动 server 后按日志里的绑定码绑定）");
+        println!("feishu chat      -（未绑定：启动 server 后自动用应用所有者绑定）");
     }
     println!("sources:");
     for source in &sources {
