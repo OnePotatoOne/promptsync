@@ -460,6 +460,9 @@ fn configure_secret(config: &mut Config, paths: &Paths, prompter: &Prompter) -> 
         if value.trim().is_empty() {
             return Ok(());
         }
+        if let Some(warning) = ClusterSecret::passphrase_warning(&value) {
+            eprintln!("{warning}");
+        }
         match ClusterSecret::from_input(&value) {
             Ok(secret) => {
                 apply(

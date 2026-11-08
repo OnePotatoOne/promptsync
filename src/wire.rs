@@ -20,6 +20,22 @@ pub const MAX_FRAGMENTS: usize = 4096;
 pub const MAX_MESSAGE: usize = FRAG_PAYLOAD * MAX_FRAGMENTS;
 const ACK_WORDS: usize = MAX_FRAGMENTS / 64;
 const ACK_PAYLOAD_LEN: usize = 8 + ACK_WORDS * 8;
+/// How long a completed incoming message id is remembered. Retransmissions of
+/// it (sender missed our ACK) are answered with a full ACK instead of being
+/// delivered again. Comfortably longer than any send timeout.
+const COMPLETED_TTL: Duration = Duration::from_secs(60);
+/// Upper bound for remembered completed ids (one session sends a handful of
+/// messages; the cap only protects against a misbehaving authenticated peer).
+const MAX_COMPLETED_IDS: usize = 4096;
+/// Messages reassembled at the same time. A session exchanges one request and
+/// one response at a time, so this only caps memory an authenticated peer can
+/// tie up (each entry may grow to `MAX_MESSAGE`).
+const MAX_REASSEMBLY: usize = 8;
+/// First retransmission timeout before any RTT is known.
+const DEFAULT_RTO: Duration = Duration::from_millis(250);
+/// Bounds for the RTT-derived retransmission timeout.
+const MAX_INITIAL_RTO: Duration = Duration::from_secs(4);
+const MAX_BACKOFF_RTO: Duration = Duration::from_secs(6);
 
 pub type PacketReceiver = mpsc::Receiver<Vec<u8>>;
 
@@ -115,9 +131,13 @@ pub struct Channel {
     rx: PacketReceiver,
     pending_out: HashMap<u32, Outgoing>,
     reassembly: HashMap<u32, Reassembly>,
+    /// Incoming message ids already delivered: id -> (fragment count, when).
+    completed_ids: HashMap<u32, (u16, Instant)>,
     completed: VecDeque<Vec<u8>>,
     stats: ChannelStats,
     pump: Option<tokio::task::JoinHandle<()>>,
+    /// Smoothed round-trip time; `None` until a hint or a clean sample.
+    srtt: Option<Duration>,
 }
 
 impl Drop for Channel {
@@ -153,9 +173,34 @@ impl Channel {
             rx,
             pending_out: HashMap::new(),
             reassembly: HashMap::new(),
+            completed_ids: HashMap::new(),
             completed: VecDeque::new(),
             stats: ChannelStats::default(),
             pump,
+            srtt: None,
+        }
+    }
+
+    /// Feed one round-trip measurement into the smoothed RTT.
+    ///
+    /// `rtt` comes from the handshake (agent), from READY -> first request
+    /// (server) or from a message acknowledged without retransmission. Uses the
+    /// classic 7/8 smoothing so one slow packet does not dominate.
+    pub fn set_rtt_hint(&mut self, rtt: Duration) {
+        let rtt = rtt.min(MAX_INITIAL_RTO);
+        self.srtt = Some(match self.srtt {
+            None => rtt,
+            Some(previous) => (previous * 7 + rtt) / 8,
+        });
+    }
+
+    /// Retransmission timeout for the first round of a message: twice the
+    /// smoothed RTT plus slack, never below the LAN default. Without it a link
+    /// with a 450 ms RTT retransmitted every fragment before the ACK arrived.
+    fn initial_rto(&self) -> Duration {
+        match self.srtt {
+            Some(rtt) => (rtt * 2 + Duration::from_millis(50)).clamp(DEFAULT_RTO, MAX_INITIAL_RTO),
+            None => DEFAULT_RTO,
         }
     }
 
@@ -200,7 +245,12 @@ impl Channel {
         };
         self.pending_out.insert(msg_id, outgoing);
         let deadline = Instant::now() + timeout;
-        let mut rto = Duration::from_millis(250);
+        let mut rto = self.initial_rto();
+        let max_rto = (rto * 2).clamp(Duration::from_millis(1500), MAX_BACKOFF_RTO);
+        let started = Instant::now();
+        // Karn's rule: only a message acknowledged in its first round gives
+        // an unambiguous RTT sample.
+        let mut retransmitted = false;
 
         loop {
             let missing: Vec<usize> = {
@@ -215,6 +265,11 @@ impl Channel {
             if missing.is_empty() {
                 self.pending_out.remove(&msg_id);
                 self.stats.messages_sent += 1;
+                if !retransmitted && frag_count == 1 {
+                    // Multi-fragment sends include serialisation time; a
+                    // single fragment is the cleanest round-trip sample.
+                    self.set_rtt_hint(started.elapsed());
+                }
                 return Ok(());
             }
             for index in missing {
@@ -253,7 +308,8 @@ impl Channel {
                     "timed out sending message {msg_id} ({frag_count} fragments, {unacknowledged} unacknowledged)"
                 );
             }
-            rto = (rto * 3 / 2).min(Duration::from_millis(1500));
+            retransmitted = true;
+            rto = (rto * 3 / 2).min(max_rto);
         }
     }
 
@@ -427,7 +483,27 @@ impl Channel {
         }
         self.reassembly
             .retain(|_, entry| entry.created.elapsed() < Duration::from_secs(30));
+        self.completed_ids
+            .retain(|_, (_, at)| at.elapsed() < COMPLETED_TTL);
 
+        // Retransmission of a message we already delivered: the sender missed
+        // our ACK (lost, or RTT above its RTO). Re-acknowledge everything so it
+        // stops, but never hand the payload to the application twice.
+        if let Some((done_count, _)) = self.completed_ids.get(&header.msg_id).copied() {
+            if done_count == header.frag_count {
+                let all = vec![true; done_count as usize];
+                self.send_ack(header.msg_id, done_count, &all).await?;
+            } else {
+                self.stats.invalid_packets += 1;
+            }
+            return Ok(());
+        }
+
+        if !self.reassembly.contains_key(&header.msg_id) && self.reassembly.len() >= MAX_REASSEMBLY
+        {
+            self.stats.invalid_packets += 1;
+            return Ok(());
+        }
         let entry = self
             .reassembly
             .entry(header.msg_id)
@@ -453,6 +529,19 @@ impl Channel {
             }
             self.send_ack(header.msg_id, header.frag_count, &acked)
                 .await?;
+            if self.completed_ids.len() >= MAX_COMPLETED_IDS {
+                // Drop the oldest record; legitimate sessions never get here.
+                if let Some(oldest) = self
+                    .completed_ids
+                    .iter()
+                    .min_by_key(|(_, (_, at))| *at)
+                    .map(|(id, _)| *id)
+                {
+                    self.completed_ids.remove(&oldest);
+                }
+            }
+            self.completed_ids
+                .insert(header.msg_id, (header.frag_count, Instant::now()));
             self.stats.messages_received += 1;
             self.completed.push_back(message);
         } else if let Some(entry) = self.reassembly.get(&header.msg_id) {
@@ -595,6 +684,46 @@ mod tests {
         );
         send_result.unwrap();
         assert_eq!(recv_result.unwrap(), b"bye");
+    }
+
+    /// A fragment retransmitted after the receiver already completed the
+    /// message (its ACK was lost, or the RTT exceeded the 250 ms RTO) carries a
+    /// fresh record counter, so the replay window accepts it. It must still not
+    /// be delivered a second time: a duplicated request makes the server answer
+    /// twice and the agent then reads a stale STATUS as the BUNDLE reply.
+    #[tokio::test]
+    async fn retransmitted_fragment_is_not_delivered_twice() {
+        let (mut client, mut server) = pair().await;
+        let msg_id = client.alloc_msg_id();
+        // Original transmission and an RTO retransmission of the same fragment.
+        client.transmit(msg_id, 0, 1, b"status").await.unwrap();
+        client.transmit(msg_id, 0, 1, b"status").await.unwrap();
+        assert_eq!(
+            server.recv_message(Duration::from_secs(3)).await.unwrap(),
+            b"status"
+        );
+        // The next real message must be what the server reads next.
+        let (send_result, recv_result) = tokio::join!(
+            client.send_message(b"bundle", Duration::from_secs(3)),
+            server.recv_message(Duration::from_secs(3))
+        );
+        send_result.unwrap();
+        assert_eq!(recv_result.unwrap(), b"bundle");
+    }
+
+    /// A known RTT must stretch the first retransmission timeout beyond it, so
+    /// a 450 ms link does not resend every fragment before the ACK can arrive.
+    #[tokio::test]
+    async fn rtt_hint_stretches_the_retransmission_timeout() {
+        let (mut client, _server) = pair().await;
+        assert_eq!(client.initial_rto(), DEFAULT_RTO);
+        client.set_rtt_hint(Duration::from_millis(450));
+        assert!(client.initial_rto() > Duration::from_millis(900));
+        assert!(client.initial_rto() <= MAX_INITIAL_RTO);
+        // A fast link never drops below the LAN default.
+        let (mut fast, _peer) = pair().await;
+        fast.set_rtt_hint(Duration::from_millis(5));
+        assert_eq!(fast.initial_rto(), DEFAULT_RTO);
     }
 
     #[tokio::test]

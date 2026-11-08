@@ -50,6 +50,9 @@ pub struct ServerConfig {
     pub monitor_interval_secs: u64,
     /// Agent state is forgotten after this many seconds of silence.
     pub forget_agent_after_secs: u64,
+    /// Hex Ed25519 seed that signs every manifest. Generated on the first
+    /// server start; agents pin the matching public key. Keep it private.
+    pub signing_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +70,10 @@ pub struct AgentConfig {
     pub offline_threshold_secs: u64,
     /// Free-form identifier used in logs and Feishu alerts. Empty = hostname.
     pub agent_id: String,
+    /// Hex Ed25519 public key of the server (from `promptsync ports` on the
+    /// server). Empty = trust the key seen on first contact and pin it in the
+    /// agent state; a different key afterwards is refused.
+    pub server_public_key: String,
     pub handshake_timeout_secs: u64,
     pub request_timeout_secs: u64,
     pub knock_interval_ms: u64,
@@ -179,6 +186,7 @@ impl Default for ServerConfig {
             monitor_agents: true,
             monitor_interval_secs: 5,
             forget_agent_after_secs: 7 * 24 * 3600,
+            signing_key: String::new(),
         }
     }
 }
@@ -192,6 +200,7 @@ impl Default for AgentConfig {
             poll_secs: DEFAULT_POLL_SECS,
             offline_threshold_secs: DEFAULT_OFFLINE_THRESHOLD_SECS,
             agent_id: String::new(),
+            server_public_key: String::new(),
             handshake_timeout_secs: 4,
             request_timeout_secs: 8,
             knock_interval_ms: 55,
@@ -355,6 +364,21 @@ impl Config {
         Ok(Some(secret))
     }
 
+    /// Generate `[server] signing_key` when it is empty and write it to `path`.
+    ///
+    /// Returns `true` when a new key was created. Called for the server role
+    /// only; agents never need (and must not have) the private key.
+    pub fn ensure_signing_key(&mut self, path: &Path) -> Result<bool> {
+        if !self.server.signing_key.trim().is_empty() {
+            return Ok(false);
+        }
+        let seed = crate::crypto::ServerSigner::generate_hex();
+        set_value(path, Some("server"), "signing_key", &format!("\"{seed}\""))
+            .with_context(|| format!("writing server.signing_key to {}", path.display()))?;
+        self.server.signing_key = seed;
+        Ok(true)
+    }
+
     pub fn save(&self, path: &Path) -> Result<()> {
         let body = toml::to_string_pretty(self).context("serialising config")?;
         let header = "\
@@ -394,15 +418,35 @@ impl Config {
         if self.server.max_sessions == 0 {
             bail!("server.max_sessions must be greater than 0");
         }
+        for (name, value) in [
+            ("server.signing_key", &self.server.signing_key),
+            ("agent.server_public_key", &self.agent.server_public_key),
+        ] {
+            let value = value.trim();
+            if !value.is_empty()
+                && (value.len() != 64 || !value.chars().all(|c| c.is_ascii_hexdigit()))
+            {
+                bail!("{name} must be empty or 64 hex characters");
+            }
+        }
         let app_id = self.feishu.app.app_id.trim();
         let app_secret = self.feishu.app.app_secret.trim();
         if app_id.is_empty() != app_secret.is_empty() {
             bail!("feishu.app.app_id and feishu.app.app_secret must be set together");
         }
-        if !self.feishu.app.api_base.starts_with("http://")
-            && !self.feishu.app.api_base.starts_with("https://")
-        {
-            bail!("feishu.app.api_base must start with http:// or https://");
+        // app_secret and tenant tokens travel to api_base, so plain http is
+        // only accepted for a loopback mock (tests, local debugging).
+        let api_base = self.feishu.app.api_base.trim();
+        let loopback_http = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
+            .iter()
+            .any(|prefix| {
+                api_base
+                    .strip_prefix(prefix)
+                    .map(|rest| rest.is_empty() || rest.starts_with(':') || rest.starts_with('/'))
+                    .unwrap_or(false)
+            });
+        if !api_base.starts_with("https://") && !loopback_http {
+            bail!("feishu.app.api_base must use https:// (plain http is only allowed for 127.0.0.1/localhost)");
         }
         if self.feishu.control.poll_secs == 0 {
             bail!("feishu.control.poll_secs must be greater than 0");
@@ -656,6 +700,28 @@ mod tests {
         assert!(text.contains("# header"));
         assert!(text.contains("[agent]"));
         assert!(text.contains(&format!("cluster_secret = \"{hex}\"")));
+    }
+
+    /// app_secret must never be sent over plain http except to a local mock.
+    #[test]
+    fn api_base_requires_https_except_loopback() {
+        let mut config = Config::default();
+        for ok in [
+            "https://open.feishu.cn",
+            "http://127.0.0.1:8080",
+            "http://localhost",
+        ] {
+            config.feishu.app.api_base = ok.to_string();
+            assert!(config.validate().is_ok(), "{ok} should be accepted");
+        }
+        for bad in [
+            "http://open.feishu.cn",
+            "http://127.0.0.1.evil.example",
+            "ftp://x",
+        ] {
+            config.feishu.app.api_base = bad.to_string();
+            assert!(config.validate().is_err(), "{bad} should be rejected");
+        }
     }
 
     #[test]

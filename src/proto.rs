@@ -7,9 +7,24 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
-    Status { agent_id: String },
-    Bundle { agent_id: String },
-    Bye { agent_id: String },
+    /// Ask for the current manifest. `applied_hash` is the server hash this
+    /// agent applied last (empty on first contact / older agents); the server
+    /// shows it in `--agents` so a lagging machine is visible.
+    Status {
+        agent_id: String,
+        #[serde(default)]
+        applied_hash: String,
+    },
+    Bundle {
+        agent_id: String,
+    },
+    /// End of session. `applied_hash` reports the server hash the agent holds
+    /// after this cycle (after a pull it is the freshly applied bundle).
+    Bye {
+        agent_id: String,
+        #[serde(default)]
+        applied_hash: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +53,41 @@ pub struct Manifest {
     pub feishu_app_id: String,
     #[serde(default)]
     pub feishu_owner_open_id: String,
+    /// Hex Ed25519 public key of the server (empty on older servers).
+    #[serde(default)]
+    pub server_key: String,
+    /// Hex Ed25519 signature over `signing_bytes()` (empty on older servers).
+    #[serde(default)]
+    pub signature: String,
+}
+
+impl Manifest {
+    /// Canonical bytes covered by the server signature.
+    ///
+    /// Every field an agent acts on is included: the content hash (the bundle
+    /// is checked against it), the adapter target, the Feishu recipient it may
+    /// adopt, and `updated_unix`, which agents use to refuse rollbacks to an
+    /// older signed manifest. Each field is length-prefixed so no two
+    /// different manifests serialise to the same bytes. `server_key` and
+    /// `signature` themselves are not covered.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        out.extend_from_slice(b"promptsync-manifest-sig-v1");
+        out.extend_from_slice(&self.epoch.to_be_bytes());
+        out.extend_from_slice(&(self.files as u64).to_be_bytes());
+        out.extend_from_slice(&self.bytes.to_be_bytes());
+        out.extend_from_slice(&self.updated_unix.to_be_bytes());
+        for field in [
+            &self.hash,
+            &self.target,
+            &self.feishu_app_id,
+            &self.feishu_owner_open_id,
+        ] {
+            out.extend_from_slice(&(field.len() as u64).to_be_bytes());
+            out.extend_from_slice(field.as_bytes());
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

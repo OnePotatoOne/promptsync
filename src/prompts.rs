@@ -112,6 +112,27 @@ fn walk(
     }
 }
 
+/// Whether `relative` (a path below `source.root`, `/`-separated) is a file
+/// this machine would sync itself.
+///
+/// Mirrors `scan`: the path must match one of the source's globs and must not
+/// contain hidden components. Agents use it to reject bundle entries that are
+/// inside a configured root but outside its globs, so a server (or anyone who
+/// holds the shared cluster secret and can impersonate it) cannot drop
+/// arbitrary files such as Cindy skills or memories next to the prompts.
+pub fn source_accepts(source: &SourceSpec, relative: &str) -> bool {
+    if relative
+        .split('/')
+        .any(|part| part.is_empty() || part.starts_with('.'))
+    {
+        return false;
+    }
+    source
+        .globs
+        .iter()
+        .any(|pattern| globpat::matches(pattern, relative))
+}
+
 /// Collect every managed prompt file, keyed by `<source id>/<relative path>`.
 pub fn scan(
     sources: &[SourceSpec],
@@ -696,6 +717,20 @@ mod tests {
             fs::read_to_string(outside.join("old.md")).unwrap(),
             "do not delete"
         );
+    }
+
+    #[test]
+    fn source_accepts_only_glob_matches_without_hidden_parts() {
+        let source = SourceSpec {
+            id: "cindy-bots".to_string(),
+            root: PathBuf::from("/nowhere"),
+            globs: vec!["*/bots/*/SOUL.md".to_string()],
+        };
+        assert!(source_accepts(&source, "owner/bots/cindy/SOUL.md"));
+        assert!(!source_accepts(&source, "owner/bots/cindy/skills/run.js"));
+        assert!(!source_accepts(&source, "owner/memories/SOUL.md"));
+        assert!(!source_accepts(&source, ".hidden/bots/cindy/SOUL.md"));
+        assert!(!source_accepts(&source, "owner//bots/cindy/SOUL.md"));
     }
 
     #[test]

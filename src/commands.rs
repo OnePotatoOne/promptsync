@@ -133,16 +133,26 @@ fn agents_text(status: &Status) -> String {
     )];
     for agent in &status.agents {
         let online = is_online(status, agent.last_seen_unix);
+        // The hash is what the agent reports it holds; compare it with ours
+        // so a machine that stopped applying updates stands out.
+        let sync_mark = if agent.hash.trim().is_empty() {
+            ""
+        } else if agent.hash.trim() == status.hash.trim() {
+            " ✓"
+        } else {
+            " 落后"
+        };
         lines.push(format!(
-            "{} {:<18} {:>7} 前  {:<15} {}",
+            "{} {:<18} {:>7} 前  {:<15} {}{}",
             if online { "●" } else { "○" },
             truncate(&agent.id, 18),
             age(status.now, agent.last_seen_unix),
             truncate(&agent.peer, 15),
             short_hash(&agent.hash),
+            sync_mark,
         ));
     }
-    lines.push("● 在线　○ 离线".to_string());
+    lines.push("● 在线　○ 离线　✓ 已是最新　落后 = 还没拿到当前版本".to_string());
     lines.join("\n")
 }
 

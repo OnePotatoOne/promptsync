@@ -12,7 +12,7 @@
 - 绑定后可以直接给机器人**私聊发纯文本**，服务端自动覆盖唯一那个 prompt 文件，agent 再自动同步。
 - agent 拉取后**自动适配本机客户端**：Codex、Claude Code、Kimi、DeepSeek、Cindy 的全局指令文件一起更新，覆盖前自动备份。
 - **首次启动自动生成随机集群密钥**并写入本机配置（同时打印一次）；仓库和发布产物里没有固定密钥。其他机器用同一串密钥或同一句口令对齐。
-- **个人配置集中在一个目录**（默认 `./config`，空目录启动时自动从模板生成，整个目录被 git 忽略；当前目录还没有配置、而 `~/.promptsync/config.toml` 已存在时会直接复用它，避免换目录启动生成第二份密钥）。
+- **个人配置集中在一个目录**（默认 `./config`，空目录启动时自动从模板生成，整个目录被 git 忽略；当前目录本身就是配置目录（里面直接有 `config.toml`）时直接用当前目录；当前目录还没有配置、而 `~/.promptsync/config.toml` 已存在时会直接复用它，避免换目录启动生成第二份密钥）。
 - 单文件 Rust 二进制，本地编译；GitHub Actions 交叉编译各平台裸二进制。
 
 > 这是「可信内网/自建服务器 + 自己的多台电脑」场景的工具，不是面向公网多租户的服务。安全边界见 [安全模型](#安全模型与边界)。
@@ -105,15 +105,21 @@ cd ~/workspace/promptSync
 
 ### 1.4 启动 agent
 
-在每台需要同步的电脑上，把 `config/config.toml` 里的 `agent.server` 改成分机地址：
+在每台需要同步的电脑上，**先对齐集群密钥，再连 server**：
 
 ```bash
-# 先手动跑一次看结果（带 --server/--once 时不提问）
-./target/release/promptsync agent --server 192.168.1.10 --once
-
-# 前台常驻（首次会给出配置指引并要求确认）
+# 推荐：在终端里直接启动，向导第 2 步粘贴 server 的密钥
 ./target/release/promptsync agent
+
+# 脚本/服务方式：先写入 server 的密钥（从 stdin 读，不留在 shell 历史里），再跑一次看结果
+printf '%s\n' '<server 打印的密钥>' | ./target/release/promptsync secret --set -
+./target/release/promptsync agent --server 192.168.1.10 --once
 ```
+
+- agent 带 `--server` / `--port` / `--once` 或在非交互环境运行时**不会自动生成密钥**：配置里没有密钥就直接报错退出，并告诉你怎么写入 server 的密钥（随机生成的密钥永远连不上任何 server）。
+- 握手第一次失败时，agent 会打印一份排查清单（本机密钥指纹、数据端口、敲门端口、各原因在 server 日志里的表现），`--once` 也一样。
+- server 在 `[server]` 里固定了 `port` / `knock_ports` 时，agent 必须写同样的值；在 server 上运行 `promptsync ports`，`agents of this server` 一段会直接列出 agent 要填什么。
+- `agent.server` 填域名时优先使用 IPv4 地址（server 默认只监听 IPv4 的 `0.0.0.0`）。
 
 长期运行用 `systemd --user` / `launchd`，见 [第 8 节](#8-开机自启动)。
 
@@ -131,6 +137,7 @@ cd ~/workspace/promptSync
 3. **兼容旧方式**：`promptsync secret --set <64 位 hex>` 仍然有效（例如从旧配置迁移）。
 
 ```bash
+promptsync secret --set -       # 从 stdin 读取密钥/口令（不进 shell 历史和 ps）
 promptsync secret --show        # 查看当前十六进制（注意保密，仅排障用）
 promptsync secret --generate    # 生成一个新的随机 hex（高级用法）
 ```
@@ -239,6 +246,8 @@ agent                         server
 - **密钥不落地仓库/二进制**：每台机器首次启动时生成 32 字节随机集群密钥，写进本机 `config.toml`（0600），同时打印一次；`build.rs` 只算非密钥的构建指纹。仓库中没有任何固定口令或端口。
 - **个人配置不进仓库**：默认配置目录 `./config` 整体被 `.gitignore` 忽略；CI 守卫会拒绝任何 `secrets/`、`config/`、`*.pem`、`*.key`、`.env` 等被跟踪。
 - **握手**：临时 X25519（前向保密）+ 用集群密钥对完整报文做 HMAC-SHA256（双向认证、防中间人、防时钟外重放 ±600s）。
+- **server 签名（v0.4.0 起）**：集群密钥所有机器共用，只能证明"对方在集群里"，不能证明"对方是 server"。所以 server 另有一把只在自己手里的 Ed25519 签名私钥（首次启动自动生成，存 `[server] signing_key`），每次回复都对 hash、下发目标、飞书接收人和版本时间签名。agent 首次连接时记住 server 公钥（`state/agent-state.json`），也可以手动填 `[agent] server_public_key` 固定；之后公钥变化、签名无效、版本时间倒退（回滚到旧 prompt）一律拒绝同步。
+- **只写本机会同步的文件**：server 下发的文件必须落在本机该 source 的 `globs` 里，否则拒绝写入，防止往 Cindy 的 owners 目录里写入 skills / memories 等任意文件。
 - **会话密钥**：HKDF-SHA256 从 ECDH 共享密钥 + 双方 nonce 派生，上下行各一把 AES-256-GCM 密钥。
 - **记录层**：每个报文独立 nonce（方向前缀 + 单调计数），1024 位重放窗口；篡改即认证失败、静默丢弃。
 - **端口敲门（随机化）**：集群密钥推导出 12 个端口的池；每次尝试由 agent 随机选 3–6 个、随机顺序、随机延迟（含首包随机偏移）。报文 HMAC 标签覆盖 `total + slot + flow id + 时间戳`，且校验「收到的端口 == 声明的 slot」，所以包不能被挪到别的端口。必须在 6s 窗口内、来自同一源 IP 集齐声明的 `total` 个不同 slot 才算通过；时间戳仅接受 ±60s，已完成过的 flow id 会被记忆 15 分钟，重放不会二次开门。无效敲门**不回任何包**。
@@ -250,7 +259,8 @@ agent                         server
 
 1. **首次启动生成的密钥就是集群密钥**：release 二进制不含固定密钥；每台机器首次运行会生成并打印自己的密钥。把 server 的密钥复制到 agent，或所有机器输入同一句口令；密钥只存在本机 `config.toml`（0600），不要提交、不要发到公开群。
 2. **用户态端口敲门 ≠ 防火墙敲门**：本工具不修改 iptables/nftables/pf。扫描器看到端口是关闭的，但服务器本机上仍能看到进程；如果需要内核级隐藏，可在防火墙只放行敲门端口池 + 数据端口给 `promptsync` 用户。
-3. **无 per-agent 身份**：所有 agent 共享集群密钥。任何拿到密钥的人都能读 prompt 集；如需区分设备，请为每台机器使用不同的 `cluster_secret` 与独立端口（多实例），或后续扩展为每设备密钥。
+3. **无 per-agent 身份**：所有 agent 共享集群密钥。任何拿到密钥的人都能**读** prompt 集；但从 v0.4.0 起无法再冒充 server **写入** prompt（需要 server 的签名私钥）。如需区分设备的读取权限，请为每台机器使用不同的 `cluster_secret` 与独立端口（多实例），或后续扩展为每设备密钥。
+   - prompt 会写进 Claude Code / Codex 等能执行命令的 AI 客户端的全局指令：**谁控制了 server、server 的 `signing_key` 或绑定的飞书账号，谁就能指挥这些 AI**。请像保护 SSH 私钥一样保护它们。
 4. **UDP 可靠性**：本工具自带分片/ACK/重传，但极端丢包或 NAT 表项超时会失败并重试下一轮；不保证跨公网稳定，推荐内网、WireGuard/Tailscale 等加密隧道内使用（隧道 + 本工具加密 = 双层保护）。
 5. **服务端可信**：服务端会覆盖 agent 本地 prompt，请只把长期在线、你信任的机器设为 server。
 6. **飞书凭据只在本地**：`app_id`/`app_secret` 保存在每台机器自己的 `config/config.toml`（0600，git 忽略），不会编进二进制，也不会进 CI 产物。agent 侧离线告警也需要这份凭据（见第 5 节的安全取舍）。
@@ -422,7 +432,7 @@ repeat_alert_secs = 0
 app_id = ""                # 飞书自建应用（向导可一键创建）
 app_secret = ""            # 只在本机配置目录
 owner_open_id = ""         # 绑定后自动写入；离线告警也发给它
-api_base = "https://open.feishu.cn"
+api_base = "https://open.feishu.cn"   # 必须是 https（app_secret 会发到这里）；http 只允许 127.0.0.1/localhost 调试
 
 [feishu.control]
 poll_secs = 5              # 轮询私聊的间隔（未绑定时也用它重试绑定）
@@ -536,9 +546,14 @@ release 矩阵：`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、`x86
 |---|---|
 | 配置目录不对 / 找不到配置 | 只读命令不会创建配置，会直接报 `no config file at <路径>`；用 `--config-dir` 或 `PROMPTSYNC_CONFIG_DIR` 指向正确目录 |
 | 服务启动后生成了新的空配置 | 服务的工作目录变了；unit 里设置 `WorkingDirectory` 并传 `--config-dir <绝对路径>` |
-| `no handshake answer` | 两端 `promptsync ports` 看数据端口与敲门端口池是否一致；`cluster_secret` 是否相同；防火墙是否放行整个 UDP 端口池 |
+| `no handshake answer` | 先看 agent 日志里的排查清单；两端 `promptsync ports` 对比密钥指纹、数据端口与敲门端口池；server 是否在运行；防火墙/安全组是否放行整个 UDP 端口池；两端时钟差是否在 60 秒内 |
+| `server 公钥变了` | agent 记住的 server 公钥和这次收到的不同，已拒绝同步。若确实重装/更换了 server：在 server 上 `promptsync ports` 拿到新公钥填进 agent 的 `[agent] server_public_key`，或删除 agent `state/agent-state.json` 里的 `server_key` 重新信任 |
+| `server 没有签名这次回复` | agent 已信任过 server 公钥，但 server 是旧版本（不签名）：把 server 升级到同一版本 |
+| `疑似回滚到旧版本` | server 回复的版本时间早于 agent 已接受过的：检查 server 时钟是否被调回过去，或是否有人重放旧回复 |
+| `还没有集群密钥` 后退出 | agent 以脚本/服务方式首次启动时不再自动生成密钥：`printf '%s\n' '<server 的密钥>' \| promptsync secret --set -`，或在终端里运行 `promptsync agent` 走向导 |
 | `HELLO failed authentication (cluster secret mismatch?)` | 口令不一致，所有机器输入同一句话（`secret --set "同一句口令"`）；旧 64 位 hex 也能用 |
-| 每轮都拉包 | 本地有 agent 未配置的 source（日志有 `skipping ...`），或本地文件被反复改动 |
+| 每轮都拉包 | 0.3.2 及更早版本的已知问题：agent 本地同步目录里有 server 没有的文件（例如其他 bot 的 SOUL.md）时会每轮重拉，升级即可；新版本仍出现时，检查本地文件是否被反复改动 |
+| 日志 `outside the globs of its source` | server 下发的文件不在本机该 source 的 `globs` 里，已拒绝写入（防止往同步根目录里写入任意文件）；需要同步就在 agent 上放宽 globs |
 | `bundle too large` | 调大 `sync.max_bundle_bytes`（单条加密消息上限约 4.4 MiB，base64 后实际可传约 3 MiB） |
 | 时间戳相关错误 | 两端系统时钟偏差：敲门容忍 ±60s，握手 ±600s，先校时（NTP） |
 | 端口被占用 | `server.port` 与其他服务冲突；数据端口只在敲门后绑定，但配置端口仍需唯一 |

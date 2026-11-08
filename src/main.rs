@@ -93,8 +93,9 @@ enum Command {
         /// Print a fresh random secret
         #[arg(long)]
         generate: bool,
-        /// Store this passphrase (or legacy 64-hex secret) in the configuration file
-        #[arg(long, value_name = "PASSPHRASE")]
+        /// Store this passphrase (or 64-hex secret) in the configuration file;
+        /// `-` reads it from stdin (keeps it out of shell history and `ps`)
+        #[arg(long, value_name = "PASSPHRASE", allow_hyphen_values = true)]
         set: Option<String>,
     },
     /// Send a test message through the Feishu app
@@ -146,20 +147,6 @@ async fn dispatch(cli: Cli) -> Result<u8> {
     }
     let (mut config, created) = paths.load()?;
 
-    // First start (or an old config created before this feature) gets a random
-    // cluster secret. Never fall back to a key compiled into the binary: that
-    // would make every download of the public release share the same key.
-    match &cli.command {
-        Command::Server { .. } | Command::Agent { .. } => {
-            ensure_cluster_secret(&paths, &mut config, false)?
-        }
-        Command::Status { json } => ensure_cluster_secret(&paths, &mut config, *json)?,
-        Command::Ports => ensure_cluster_secret(&paths, &mut config, false)?,
-        // `Secret` handles generation itself so `--set` does not first create a
-        // throwaway key, and `FeishuTest`/`ConfigFile` do not need one.
-        _ => false,
-    };
-
     // Interactive only for the long-running roles, and only when the caller did
     // not already pass explicit overrides (that means "scripted use").
     let explicit_override = match &cli.command {
@@ -172,6 +159,57 @@ async fn dispatch(cli: Cli) -> Result<u8> {
     let prompter = Prompter::new(!cli.non_interactive && (!explicit_override || cli.configure));
     if cli.configure && !prompter.enabled() && !cli.non_interactive {
         eprintln!("[promptsync] 当前不是交互终端，--configure 被忽略；请在终端里运行。");
+    }
+
+    // An agent never benefits from a freshly generated random secret: no server
+    // can share it, so every handshake would time out silently. Scripted agent
+    // runs (`--server`, `--once`, services) therefore refuse to start without a
+    // secret instead of generating one; the wizard asks for the server's.
+    if matches!(cli.command, Command::Agent { .. })
+        && !prompter.enabled()
+        && config.cluster_secret.trim().is_empty()
+    {
+        bail!(
+            "{} 里还没有集群密钥。agent 必须使用 server 的同一个密钥，自动生成的随机密钥永远连不上。\n\
+             先运行 `promptsync --config-dir {} secret --set \"<server 的密钥或口令>\"`，\n\
+             或在终端里直接运行 `promptsync agent`（不带 --server/--once）进入向导。",
+            paths.config_file.display(),
+            paths.config_dir.display()
+        );
+    }
+
+    // First start (or an old config created before this feature) gets a random
+    // cluster secret. Never fall back to a key compiled into the binary: that
+    // would make every download of the public release share the same key.
+    let fresh_secret = match &cli.command {
+        Command::Server { .. } | Command::Agent { .. } => {
+            ensure_cluster_secret(&paths, &mut config, false)?
+        }
+        Command::Status { json } => ensure_cluster_secret(&paths, &mut config, *json)?,
+        Command::Ports => ensure_cluster_secret(&paths, &mut config, false)?,
+        // `Secret` handles generation itself so `--set` does not first create a
+        // throwaway key, and `FeishuTest`/`ConfigFile` do not need one.
+        _ => false,
+    };
+    // A secret generated in this run has not been paired with anything yet, so
+    // treat the run like a first start: the wizard's secret step must appear
+    // even when config.toml itself already existed (e.g. created by an earlier
+    // scripted run), otherwise the random key would be used silently forever.
+    let first_start = created || fresh_secret;
+
+    // The server's signing key is generated on its first start (and added to
+    // configs created by older versions). Agents never get one.
+    if matches!(cli.command, Command::Server { .. })
+        && config.ensure_signing_key(&paths.config_file)?
+    {
+        let signer = promptsync::crypto::ServerSigner::from_hex(&config.server.signing_key)?;
+        let public = signer.public_hex();
+        println!(
+            "\n已生成 server 签名密钥（私钥保存在 {} 的 [server] signing_key，保密）。\n  公钥: {}\n  指纹: {}\n  agent 首次连接时会自动信任这把公钥；也可以把公钥填进 agent 的 [agent] server_public_key。\n",
+            paths.config_file.display(),
+            public,
+            promptsync::crypto::server_key_fingerprint(&public)
+        );
     }
 
     match &cli.command {
@@ -191,7 +229,7 @@ async fn dispatch(cli: Cli) -> Result<u8> {
                 &prompter,
                 &logger,
                 interactive::PrepareOptions {
-                    created,
+                    created: first_start,
                     force_wizard: cli.configure,
                 },
             )? {
@@ -235,7 +273,7 @@ async fn dispatch(cli: Cli) -> Result<u8> {
                 &prompter,
                 &logger,
                 interactive::PrepareOptions {
-                    created,
+                    created: first_start,
                     force_wizard: cli.configure,
                 },
             )? {
@@ -412,21 +450,83 @@ fn ports(config: &Config, paths: &Paths) -> Result<u8> {
         secret.fingerprint(),
         paths.config_file.display()
     );
+    let derived = secret.ports();
+    let port_pinned = config.server.port != 0;
+    let knock_pinned = !config.server.knock_ports.is_empty();
     println!(
-        "data port:  {} (server bind {}:{})",
-        endpoints.main, config.server.bind, endpoints.main
+        "data port:  {} (server bind {}:{}; {})",
+        endpoints.main,
+        config.server.bind,
+        endpoints.main,
+        if port_pinned {
+            "pinned by [server] port"
+        } else {
+            "derived from the secret"
+        }
     );
     println!(
-        "knock pool: {:?} ({} ports, {}..={} random per attempt)",
+        "knock pool: {:?} ({} ports, {}..={} random per attempt; {})",
         endpoints.knock_pool,
         endpoints.knock_pool.len(),
         config.agent.knock_min,
-        config.agent.knock_max
+        config.agent.knock_max,
+        if knock_pinned {
+            "pinned by [server] knock_ports"
+        } else {
+            "derived from the secret"
+        }
     );
-    println!("agent uses data port {}", agent_endpoints.main);
+    if config.server.signing_key.trim().is_empty() {
+        println!("server key: (not generated yet; created on the first `promptsync server` start)");
+    } else {
+        let public =
+            promptsync::crypto::ServerSigner::from_hex(&config.server.signing_key)?.public_hex();
+        println!(
+            "server key: fingerprint {} public {}",
+            promptsync::crypto::server_key_fingerprint(&public),
+            public
+        );
+    }
+    // What every agent of this server must use. A pinned server port is not
+    // derivable from the secret, so agents left at `port = 0` would knock and
+    // then talk to the derived port and time out silently.
+    println!("agents of this server:");
+    if port_pinned {
+        println!(
+            "  [agent] port = {}   (required: the server pins it; port = 0 would use {})",
+            endpoints.main, derived.main
+        );
+    } else {
+        println!("  [agent] port = 0   (or {})", endpoints.main);
+    }
+    if knock_pinned {
+        println!(
+            "  [agent] knock_ports = {:?}   (required: the server pins them)",
+            endpoints.knock_pool
+        );
+    } else {
+        println!("  [agent] knock_ports = []   (derived from the same secret)");
+    }
+    if !config.server.signing_key.trim().is_empty() {
+        let public =
+            promptsync::crypto::ServerSigner::from_hex(&config.server.signing_key)?.public_hex();
+        println!(
+            "  [agent] server_public_key = \"{public}\"   (optional: pins the key instead of trusting it on first contact)"
+        );
+    }
+    // The local [agent] section only matters when this machine runs an agent;
+    // say so instead of printing numbers that look authoritative.
+    let agent_matches = agent_endpoints == endpoints;
     println!(
-        "agent server target: {}:{}",
-        config.agent.server, agent_endpoints.main
+        "this machine as agent: {}:{} knock {:?}{}",
+        config.agent.server,
+        agent_endpoints.main,
+        agent_endpoints.knock_pool,
+        if agent_matches {
+            " (matches the server settings above)"
+        } else {
+            " (differs from the server settings above; only fine if the agent talks to another server)"
+        }
     );
     Ok(0)
 }
@@ -445,6 +545,22 @@ fn secret(
         return Ok(0);
     }
     if let Some(value) = set {
+        // `--set -` reads the secret from stdin so it never lands in shell
+        // history or in the process list that other local users can read.
+        let owned;
+        let value = if value == "-" {
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .context("reading the secret from stdin")?;
+            owned = line;
+            owned.as_str()
+        } else {
+            value
+        };
+        if let Some(warning) = ClusterSecret::passphrase_warning(value) {
+            eprintln!("{warning}");
+        }
         let secret = ClusterSecret::from_input(value)?;
         config.cluster_secret = secret.to_hex();
         set_cluster_secret(&paths.config_file, &secret.to_hex())?;

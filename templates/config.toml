@@ -28,6 +28,9 @@ max_sessions = 32
 monitor_agents = true
 monitor_interval_secs = 5
 forget_agent_after_secs = 604800
+# server 签名私钥（首次启动 server 自动生成，保密；agent 不需要）。
+# agent 用对应的公钥校验每次下发，防止持有集群密钥的其他机器冒充 server。
+signing_key = ""
 
 [agent]
 # 服务端主机名或 IP
@@ -36,6 +39,9 @@ server = "127.0.0.1"
 port = 0
 # 一般留空；服务端自定义敲门端口池时填写同样的列表
 knock_ports = []
+# server 公钥（在 server 上运行 `promptsync ports` 查看）。留空 = 首次连接时记住
+# server 的公钥（保存在 state/agent-state.json），之后公钥变化一律拒绝同步。
+server_public_key = ""
 # 轮询间隔（秒）
 poll_secs = 10
 # 连续失联多少秒后发飞书离线告警

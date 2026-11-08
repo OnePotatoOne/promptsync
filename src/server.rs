@@ -1,7 +1,7 @@
 //! Server role: owns the authoritative prompt set, publishes its hash and
 //! serves bundles to port-knocked, authenticated agents.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -15,7 +15,10 @@ use tokio::sync::mpsc;
 use crate::buildinfo;
 use crate::commands;
 use crate::config::Config;
-use crate::crypto::{accept_hello, ClusterSecret, SessionKeys, MAX_CLOCK_SKEW_SECS, TYPE_HELLO};
+use crate::crypto::{
+    accept_hello, server_key_fingerprint, ClusterSecret, ServerSigner, SessionKeys,
+    MAX_CLOCK_SKEW_SECS, TYPE_HELLO,
+};
 use crate::feishu;
 use crate::knock::{server_ports, Gate, KnockOutcome, KnockTracker};
 use crate::logx::Logger;
@@ -66,6 +69,10 @@ struct SessionEntry {
 struct ServerState {
     config: Config,
     secret: Arc<ClusterSecret>,
+    /// Signs every manifest; agents pin `signer_public`.
+    signer: ServerSigner,
+    /// Hex public key matching `signer`, sent with each manifest.
+    signer_public: String,
     sources: Vec<SourceSpec>,
     scan_options: ScanOptions,
     snapshot: Mutex<Snapshot>,
@@ -107,6 +114,15 @@ pub async fn run(
         ClusterSecret::resolve(&config.cluster_secret).context("resolving cluster secret")?,
     );
     let ports = server_ports(&config.server, &secret);
+    // The CLI generates the key on first start; a library caller (tests) must
+    // provide one. Never sign with a throwaway key: agents pin the public key,
+    // so a key that changes on restart would lock every agent out.
+    if config.server.signing_key.trim().is_empty() {
+        bail!("server.signing_key is empty; start the server through `promptsync server` once to generate it");
+    }
+    let signer =
+        ServerSigner::from_hex(&config.server.signing_key).context("loading server.signing_key")?;
+    let signer_public = signer.public_hex();
     fs::create_dir_all(&data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
     let sources = resolve_sources(&config.sync);
     let scan_options = ScanOptions::from(&config.sync);
@@ -119,6 +135,10 @@ pub async fn run(
         secret.fingerprint(),
         ports.main,
         ports.knock_pool
+    ));
+    logger.info(format!(
+        "server signing key {} (public key {signer_public}; agents pin it on first contact or via [agent] server_public_key)",
+        server_key_fingerprint(&signer_public)
     ));
     logger.info(format!(
         "watching {} source(s): {} files, {} hash {}",
@@ -184,6 +204,8 @@ pub async fn run(
         hello_attempts: Mutex::new(HashMap::new()),
         config,
         secret,
+        signer,
+        signer_public,
         sources,
         scan_options,
         registry: Mutex::new(registry),
@@ -587,6 +609,7 @@ async fn handle_datagram(
                     instance,
                     handshake.keys,
                     rx,
+                    Instant::now(),
                 ));
             }
             Err(err) => {
@@ -637,6 +660,10 @@ fn allow_hello(state: &ServerState, ip: IpAddr) -> bool {
     true
 }
 
+/// One authenticated session: answers STATUS / BUNDLE / BYE until the agent
+/// leaves or stays silent for 30 s. `ready_sent` is when READY went out and
+/// seeds the channel RTT from the first request.
+#[allow(clippy::too_many_arguments)]
 async fn session_task(
     state: Arc<ServerState>,
     socket: Arc<UdpSocket>,
@@ -645,15 +672,23 @@ async fn session_task(
     instance: u64,
     keys: SessionKeys,
     rx: mpsc::Receiver<Vec<u8>>,
+    ready_sent: Instant,
 ) {
     state.session_count.fetch_add(1, Ordering::SeqCst);
     let mut channel = Channel::new(socket, peer, session_id, &keys, false, rx, None);
     let mut agent_id = String::from("unknown");
+    let mut first_request = true;
     loop {
         let payload = match channel.recv_message(Duration::from_secs(30)).await {
             Ok(payload) => payload,
             Err(_) => break,
         };
+        if first_request {
+            // The agent sends STATUS right after READY, so this is one RTT and
+            // seeds the timeout for our (possibly large) replies.
+            channel.set_rtt_hint(ready_sent.elapsed());
+            first_request = false;
+        }
         state.gate.touch(peer.ip());
         let request = match decode_request(&payload) {
             Ok(request) => request,
@@ -672,10 +707,15 @@ async fn session_task(
             }
         };
         match request {
-            Request::Status { agent_id: id } => {
+            Request::Status {
+                agent_id: id,
+                applied_hash,
+            } => {
                 agent_id = sanitize_agent_id(&id);
                 let snapshot = current_snapshot(&state);
-                state.record_agent(&agent_id, peer, &snapshot.hash);
+                // Record what the agent reports it holds, not our own hash:
+                // `--agents` must reveal a machine that is behind.
+                state.record_agent(&agent_id, peer, &sanitize_hash(&applied_hash));
                 state.logger.debug(format!(
                     "status for {agent_id} from {peer}: epoch {} hash {}",
                     snapshot.epoch,
@@ -693,7 +733,7 @@ async fn session_task(
                 } else {
                     (String::new(), String::new())
                 };
-                let manifest = Manifest {
+                let mut manifest = Manifest {
                     epoch: snapshot.epoch,
                     hash: snapshot.hash.clone(),
                     files: snapshot.entries.len(),
@@ -702,7 +742,10 @@ async fn session_task(
                     target: state.config.sync.target.clone(),
                     feishu_app_id,
                     feishu_owner_open_id,
+                    server_key: state.signer_public.clone(),
+                    signature: String::new(),
                 };
+                manifest.signature = state.signer.sign_hex(&manifest.signing_bytes());
                 if reply(&mut channel, &state.config, &Response::Status(manifest))
                     .await
                     .is_err()
@@ -713,7 +756,6 @@ async fn session_task(
             Request::Bundle { agent_id: id } => {
                 agent_id = sanitize_agent_id(&id);
                 let snapshot = current_snapshot(&state);
-                state.record_agent(&agent_id, peer, &snapshot.hash);
                 let bundle =
                     Bundle::from_entries(&snapshot.entries, snapshot.epoch, snapshot.hash.clone());
                 let encoded = match encode_response(&Response::Bundle(bundle.clone())) {
@@ -752,7 +794,18 @@ async fn session_task(
                     break;
                 }
             }
-            Request::Bye { .. } => break,
+            Request::Bye {
+                agent_id: id,
+                applied_hash,
+            } => {
+                // After a pull the agent reports the bundle it just applied.
+                let applied = sanitize_hash(&applied_hash);
+                if !applied.is_empty() {
+                    agent_id = sanitize_agent_id(&id);
+                    state.record_agent(&agent_id, peer, &applied);
+                }
+                break;
+            }
         }
     }
 
@@ -813,6 +866,19 @@ fn current_snapshot(state: &ServerState) -> Snapshot {
     }
 }
 
+/// Keep only a plausible hex hash reported by an agent (max 64 chars).
+///
+/// `hash` is untrusted input from an authenticated peer; anything that is not
+/// hex is dropped so the registry and Feishu replies stay clean.
+fn sanitize_hash(hash: &str) -> String {
+    let trimmed = hash.trim();
+    if trimmed.len() <= 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        trimmed.to_ascii_lowercase()
+    } else {
+        String::new()
+    }
+}
+
 fn sanitize_agent_id(id: &str) -> String {
     let cleaned: String = id
         .trim()
@@ -847,7 +913,10 @@ impl ServerState {
             let recovered = record.offline_reported;
             record.last_seen_unix = now;
             record.peer = peer.to_string();
-            record.hash = hash.to_string();
+            // Older agents report no hash; keep the last known value then.
+            if !hash.is_empty() {
+                record.hash = hash.to_string();
+            }
             record.offline_reported = false;
             recovered
         };

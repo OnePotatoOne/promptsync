@@ -50,6 +50,10 @@ const SECRET_KDF_SALT: &[u8] = b"promptsync cluster secret v1";
 /// entry; the derived key (hex) is what gets stored in config.toml.
 const SECRET_KDF_ROUNDS: u32 = 300_000;
 
+/// Passphrases shorter than this (in characters) trigger a warning; they are
+/// still accepted so existing setups keep working.
+pub const MIN_PASSPHRASE_CHARS: usize = 12;
+
 /// PBKDF2-HMAC-SHA256 with a single 32-byte output block.
 ///
 /// `password` is the UTF-8 passphrase, `salt` the domain separator and
@@ -125,6 +129,24 @@ impl ClusterSecret {
         )))
     }
 
+    /// Warning for a passphrase that is easy to brute-force offline, or `None`.
+    ///
+    /// `input` is what the user typed. The PBKDF2 salt is a fixed constant (all
+    /// machines must derive the same key), so one captured knock or HELLO lets
+    /// an eavesdropper test guesses offline at ~300k HMAC rounds each. Random
+    /// 64-hex secrets are not affected; short phrases are.
+    pub fn passphrase_warning(input: &str) -> Option<String> {
+        let trimmed = input.trim();
+        let is_hex = trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit());
+        let chars = trimmed.chars().count();
+        if is_hex || chars >= MIN_PASSPHRASE_CHARS {
+            return None;
+        }
+        Some(format!(
+            "⚠ 口令只有 {chars} 个字符：抓到一个敲门包就能离线暴力猜测。建议至少 {MIN_PASSPHRASE_CHARS} 个字符，或直接复制 server 生成的 64 位 hex 密钥。"
+        ))
+    }
+
     pub fn random() -> Self {
         let mut out = [0u8; 32];
         OsRng.fill_bytes(&mut out);
@@ -176,6 +198,81 @@ impl ClusterSecret {
     pub fn fingerprint(&self) -> String {
         hex::encode(&self.subkey(b"fingerprint")[..6])
     }
+}
+
+/// The server's Ed25519 identity.
+///
+/// The cluster secret is shared by every machine, so it cannot tell the server
+/// apart from an agent: any agent holding it could answer a handshake. Only
+/// the server holds this signing key; agents pin its public key and refuse
+/// manifests that are not signed by it.
+pub struct ServerSigner(ed25519_dalek::SigningKey);
+
+impl ServerSigner {
+    /// Fresh random key, returned as the 64-hex seed stored in config.toml.
+    pub fn generate_hex() -> String {
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        hex::encode(seed)
+    }
+
+    /// Load the signer from the 64-hex seed in `[server] signing_key`.
+    pub fn from_hex(value: &str) -> Result<Self> {
+        let bytes = hex::decode(value.trim()).context("server.signing_key is not hex")?;
+        let seed: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("server.signing_key must be 64 hex characters"))?;
+        Ok(Self(ed25519_dalek::SigningKey::from_bytes(&seed)))
+    }
+
+    /// Hex public key that agents pin (`[agent] server_public_key`).
+    pub fn public_hex(&self) -> String {
+        hex::encode(self.0.verifying_key().to_bytes())
+    }
+
+    /// Hex signature over `message`.
+    pub fn sign_hex(&self, message: &[u8]) -> String {
+        use ed25519_dalek::Signer;
+        hex::encode(self.0.sign(message).to_bytes())
+    }
+}
+
+/// Short fingerprint of a hex public key for logs and `ports`.
+///
+/// `public_hex` is the 64-hex key; returns the first 12 hex characters of its
+/// SHA-256, or `"invalid"` when the input is not hex.
+pub fn server_key_fingerprint(public_hex: &str) -> String {
+    use sha2::Digest;
+    match hex::decode(public_hex.trim()) {
+        Ok(bytes) => hex::encode(&Sha256::digest(bytes)[..6]),
+        Err(_) => "invalid".to_string(),
+    }
+}
+
+/// Verify `signature_hex` over `message` with the pinned `public_hex` key.
+///
+/// Uses strict verification (rejects malleable / small-order encodings).
+pub fn verify_server_signature(
+    public_hex: &str,
+    message: &[u8],
+    signature_hex: &str,
+) -> Result<()> {
+    let key_bytes: [u8; 32] = hex::decode(public_hex.trim())
+        .context("server public key is not hex")?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("server public key must be 64 hex characters"))?;
+    let signature_bytes: [u8; 64] = hex::decode(signature_hex.trim())
+        .context("server signature is not hex")?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("server signature must be 128 hex characters"))?;
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|_| anyhow!("server public key is not a valid Ed25519 key"))?;
+    let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
+    key.verify_strict(message, &signature)
+        .map_err(|_| anyhow!("server signature does not verify"))
 }
 
 /// Ports are derived from the cluster secret so that every machine sharing the
@@ -777,6 +874,20 @@ mod tests {
     }
 
     #[test]
+    fn server_signatures_verify_and_reject_tampering() {
+        let signer = ServerSigner::from_hex(&ServerSigner::generate_hex()).unwrap();
+        let public = signer.public_hex();
+        let signature = signer.sign_hex(b"manifest");
+        assert!(verify_server_signature(&public, b"manifest", &signature).is_ok());
+        assert!(verify_server_signature(&public, b"manifesT", &signature).is_err());
+        let other = ServerSigner::from_hex(&ServerSigner::generate_hex()).unwrap();
+        assert!(verify_server_signature(&other.public_hex(), b"manifest", &signature).is_err());
+        assert!(verify_server_signature(&public, b"manifest", "00").is_err());
+        assert_eq!(server_key_fingerprint(&public).len(), 12);
+        assert!(ServerSigner::from_hex("abcd").is_err());
+    }
+
+    #[test]
     fn pbkdf2_matches_rfc_vector() {
         let out = pbkdf2_sha256(b"password", b"salt", 1);
         assert_eq!(
@@ -809,5 +920,8 @@ mod tests {
     #[test]
     fn empty_passphrase_is_rejected() {
         assert!(ClusterSecret::from_input("   ").is_err());
+        assert!(ClusterSecret::passphrase_warning("alpha").is_some());
+        assert!(ClusterSecret::passphrase_warning("correct horse battery").is_none());
+        assert!(ClusterSecret::passphrase_warning(&"ab".repeat(32)).is_none());
     }
 }

@@ -49,10 +49,21 @@ impl Paths {
                 match from_env {
                     Some(value) => absolute(&expand_tilde(&value))?,
                     None => {
-                        let cwd = absolute(Path::new("config"))?;
+                        let work = std::env::current_dir()
+                            .context("resolving the current working directory")?;
+                        let cwd = work.join("config");
                         let home = dirs::home_dir().map(|home| home.join(".promptsync"));
-                        let chosen = default_dir(&cwd, home.as_deref());
-                        if chosen != cwd {
+                        let chosen = default_dir(&work, home.as_deref());
+                        if chosen == work {
+                            // Started from inside the config directory itself
+                            // (`cd config && promptsync ...`): `./config` would
+                            // be a brand-new nested config with its own secret.
+                            eprintln!(
+                                "[promptsync] 当前目录就是配置目录，使用 {}（而不是新建 {}）；要改目录请传 --config-dir",
+                                chosen.join(CONFIG_FILE_NAME).display(),
+                                cwd.join(CONFIG_FILE_NAME).display()
+                            );
+                        } else if chosen != cwd {
                             eprintln!(
                                 "[promptsync] 复用已有配置 {}（{} 里还没有 config.toml）；要改目录请传 --config-dir",
                                 chosen.join(CONFIG_FILE_NAME).display(),
@@ -172,14 +183,26 @@ fn render_template(config_dir: &Path) -> Result<String> {
 /// Pick the implicit config directory. A local `./config/config.toml` always
 /// wins (backwards compatible); otherwise an existing per-user config is
 /// reused so running from another directory does not mint a new secret.
-fn default_dir(cwd: &Path, home: Option<&Path>) -> PathBuf {
+/// Pick the default config directory when no flag or env var names one.
+///
+/// `work` is the current working directory (absolute), `home` the optional
+/// `~/.promptsync`. Order: `<work>/config/config.toml`, then `<work>/config.toml`
+/// (the user is standing inside a config directory), then an existing home
+/// config, and finally `<work>/config` (which `ensure` will create).
+fn default_dir(work: &Path, home: Option<&Path>) -> PathBuf {
+    let cwd = work.join("config");
     if cwd.join(CONFIG_FILE_NAME).exists() {
-        return cwd.to_path_buf();
+        return cwd;
+    }
+    // Inside the config directory: reusing it avoids creating config/config
+    // with a second, freshly generated cluster secret.
+    if work.join(CONFIG_FILE_NAME).exists() {
+        return work.to_path_buf();
     }
     if let Some(home) = home.filter(|home| home.join(CONFIG_FILE_NAME).exists()) {
         return home.to_path_buf();
     }
-    cwd.to_path_buf()
+    cwd
 }
 
 fn toml_escape(value: &str) -> String {
@@ -241,17 +264,16 @@ mod tests {
         let home = temp.path().join("home/.promptsync");
         fs::create_dir_all(&home).unwrap();
         fs::write(home.join(CONFIG_FILE_NAME), "cluster_secret = \"x\"\n").unwrap();
-        assert_eq!(default_dir(&cwd, Some(&home)), cwd);
+        assert_eq!(default_dir(temp.path(), Some(&home)), cwd);
     }
 
     #[test]
     fn default_dir_reuses_the_home_config_when_the_cwd_has_none() {
         let temp = tempfile::tempdir().unwrap();
-        let cwd = temp.path().join("config");
         let home = temp.path().join("home/.promptsync");
         fs::create_dir_all(&home).unwrap();
         fs::write(home.join(CONFIG_FILE_NAME), "cluster_secret = \"x\"\n").unwrap();
-        assert_eq!(default_dir(&cwd, Some(&home)), home);
+        assert_eq!(default_dir(temp.path(), Some(&home)), home);
     }
 
     #[test]
@@ -259,7 +281,21 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().join("config");
         let home = temp.path().join("home/.promptsync");
-        assert_eq!(default_dir(&cwd, Some(&home)), cwd);
+        assert_eq!(default_dir(temp.path(), Some(&home)), cwd);
+    }
+
+    /// `cd config && promptsync server` must reuse that directory instead of
+    /// creating `config/config` with a new cluster secret.
+    #[test]
+    fn default_dir_reuses_the_cwd_when_standing_inside_a_config_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let inside = temp.path().join("config");
+        fs::create_dir_all(&inside).unwrap();
+        fs::write(inside.join(CONFIG_FILE_NAME), "cluster_secret = \"x\"\n").unwrap();
+        let home = temp.path().join("home/.promptsync");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join(CONFIG_FILE_NAME), "cluster_secret = \"x\"\n").unwrap();
+        assert_eq!(default_dir(&inside, Some(&home)), inside);
     }
 
     #[test]
