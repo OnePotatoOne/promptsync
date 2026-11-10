@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "promptsync"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "aes-gcm",
  "anyhow",

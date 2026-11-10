@@ -165,6 +165,16 @@ pub struct SyncConfig {
     /// Adapter ids to skip (e.g. `["cindy-pi"]` to keep ~/AGENTS.md untouched).
     /// See `promptsync status` for the ids detected on this machine.
     pub adapt_exclude: Vec<String>,
+    /// Cindy 的 Pi 任务从哪里读取同步的 prompt（只在本机装了 Cindy 时生效）。
+    /// 可选值：
+    /// - `"auto"`（默认）：检查本机 Cindy 应用是否支持 Pi 全局指令目录，
+    ///   支持就写 `~/.pi/agent/AGENTS.md`，不支持就退回 `~/AGENTS.md`；
+    /// - `"pi-agent"`：强制写 `<PI_CODING_AGENT_DIR|~/.pi/agent>/AGENTS.md`；
+    /// - `"home"`：强制写 `~/AGENTS.md`（旧版 Cindy 只能这样覆盖 Pi 任务）。
+    ///
+    /// 无论哪种，另一个位置上由 promptsync 写入的旧副本都会备份后移走，
+    /// 避免同一份 prompt 被同一个引擎加载两次。
+    pub cindy_pi: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,6 +286,8 @@ impl Default for SyncConfig {
             adapt_clients: true,
             adapt_paths: Vec::new(),
             adapt_exclude: Vec::new(),
+            // 默认自动检测 Cindy 的 Pi 任务读取哪个全局指令文件。
+            cindy_pi: "auto".to_string(),
         }
     }
 }
@@ -458,6 +470,10 @@ impl Config {
         }
         if self.feishu.control.max_message_bytes < 1024 {
             bail!("feishu.control.max_message_bytes must be at least 1024");
+        }
+        // sync.cindy_pi 只接受三个固定取值，写错时直接报错，避免静默退回默认行为。
+        if crate::adapters::CindyPiMode::parse(&self.sync.cindy_pi).is_none() {
+            bail!("sync.cindy_pi must be \"auto\", \"pi-agent\" or \"home\"");
         }
         if self.fsync_target_invalid() {
             bail!("sync.target must look like \"<source id>/<relative path>\"");

@@ -9,6 +9,8 @@
 pub mod adapters;
 pub mod agent;
 pub mod buildinfo;
+/// 客户端指令文件的集中备份库（`<状态目录>/client-backups`）。
+pub mod client_backups;
 pub mod commands;
 pub mod config;
 pub mod crypto;

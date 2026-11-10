@@ -191,7 +191,7 @@ agent 把拉到的 prompt 再写进本机**已安装**客户端的全局指令�
 | `claude` | Claude Code（终端 + Cindy 的 Claude Code 任务） | `~/.claude/CLAUDE.md` | `CLAUDE_CONFIG_DIR` |
 | `codex` | Codex CLI | `~/.codex/AGENTS.md` | `CODEX_HOME` |
 | `cindy-codex` | Cindy 的 Codex 任务 | `CindyGlobal/codex-home/AGENTS.md` | — |
-| `cindy-pi` | Cindy 的 Pi 任务（**对话会话** + 项目会话） | `~/AGENTS.md` | — |
+| `cindy-pi` | Cindy 的 Pi 任务（**对话会话** + 项目会话） | 新版 Cindy：`~/.pi/agent/AGENTS.md`；旧版：`~/AGENTS.md`（自动判断，见下文） | `PI_CODING_AGENT_DIR` |
 | `kimi` | Kimi Code | `~/.kimi-code/AGENTS.md` | `KIMI_CODE_HOME` |
 | `deepseek` | DeepSeek Harness | `~/.dsh/AGENTS.md` | `DSH_HOME` |
 | `gemini` | Gemini CLI | `~/.gemini/GEMINI.md` | — |
@@ -202,12 +202,23 @@ agent 把拉到的 prompt 再写进本机**已安装**客户端的全局指令�
 
 - 选哪个 prompt：优先服务端 `sync.target`；否则最大的 `SOUL.md` → 最大的 `system_prompt.md` → 唯一的文件 → 最大的 Markdown。
 - 只在客户端目录已存在（或目标文件已存在）时写入，不会凭空创建一堆目录。
-- 旧文件备份为同目录的 `<文件名>.<UTC 时间>.bak`，保留 `sync.keep_backups` 份（0 = 全部保留）。
+- **旧内容统一备份到 agent 状态目录的 `client-backups/`**（默认 `config/state/client-backups/`），不再在各客户端目录、家目录里生成 `.bak`：
+  - 同一版本只存一份（`blobs/<sha256>.md`，按内容去重），`index.json` 记录每份备份原来是哪个文件、什么时间、哪一类；
+  - **原始文件**（promptsync 第一次接管某个文件前、你自己写的内容）单独标记，**永不自动清理**；
+  - 其他备份（被替换 / 移走的重复）每个文件保留最新 `sync.keep_backups` 份（0 = 全部保留）；
+  - 旧版本留在客户端目录里的 `<文件名>.<UTC 时间>.bak` 会在 agent 下一次同步时自动迁入（先写进备份库再删除原处文件）。每个文件最早的那份如果不是同步过的 prompt 版本，就识别为原始文件；
+  - 查看：`promptsync backups`（`--json` 输出 JSON），会列出原始文件、其他备份、每份对应的内容文件，以及还没迁移的旧 `.bak`。
 - 内容相同则跳过，不产生备份、不改 mtime。
 - 关闭全部：`adapt_clients = false`；关闭某几个：`adapt_exclude = ["cindy-pi"]`；额外客户端：`adapt_paths = ["~/path/to/AGENTS.md"]`。
+- **同一份 prompt 每个引擎只加载一次**：agent 会按本机实际安装的版本自动选择写入位置，并把会造成重复的旧同步副本存入备份库后移走（类别 `移走的重复`）。旧版本写过、但没有任何引擎读取的 `CindyGlobal/pi-agent-home/AGENTS.md` 也会一并归档。只有内容确实是同步副本的文件才会被移走；用户自己写的文件保持不动，日志里给出 `duplicate kept` 警告。`promptsync status` 会把待移走的文件标为 `duplicate`。
 - 飞书私聊覆盖服务端 prompt 后，服务端本机的客户端也会立即适配。
-- **Cindy 各引擎读的不是同一个文件**（Cindy 0.1.128 实测）：
-  - **Pi 任务**（对话会话默认就是 Pi）：Cindy 给每个任务一个临时 agent 目录 `pi-agent-home/run-tmp/<任务>/`，所以 `pi-agent-home/AGENTS.md` **不会被读取**。Pi 还会读取工作目录及其所有父目录里的 `AGENTS.md`，而 Cindy 的任务目录都在家目录下，所以写 `~/AGENTS.md` 就能覆盖全部 Pi 任务。Claude Code 不读 `AGENTS.md`，Codex / Kimi 只读到项目根目录为止，不会重复加载。
+- **Cindy 各引擎读的不是同一个文件**（Cindy 0.1.128 / 0.1.129、Claude Code 2.1.312 实测）：
+  - **Pi 任务**（对话会话默认就是 Pi）：Cindy 给每个任务一个临时 agent 目录 `pi-agent-home/run-tmp/<任务>/`，所以 `pi-agent-home/AGENTS.md` **不会被读取**。
+    - **新版 Cindy（0.1.129 起）**启动 Pi 任务时，会把 `<PI_CODING_AGENT_DIR|~/.pi/agent>/AGENTS.md` 复制进这个临时目录（伙伴/IM 会话除外，它们用 `SOUL.md`）。promptsync 检测到本机 Cindy 应用支持这个功能时，就写 `~/.pi/agent/AGENTS.md`，并移走旧的 `~/AGENTS.md` 同步副本。
+    - **旧版 Cindy** 只能依靠 Pi 读取工作目录及所有父目录的 `AGENTS.md`，所以写 `~/AGENTS.md`。
+  - **为什么不能同时留着 `~/AGENTS.md`**：Claude Code 在项目里没有任何 `CLAUDE.md` 时，会把父目录的 `AGENTS.md` 当作项目指令加载，于是在 Cindy 的 Claude Code 对话里，同一份 prompt 会出现两次（`~/.claude/CLAUDE.md` 一次，`~/AGENTS.md` 一次）。同理，opencode 在非 git 目录、Cindy 伙伴的 Pi 会话（再加上 `SOUL.md`）也会多读一份。
+  - **旧版 Cindy 下如何避免重复**：`~/.claude/CLAUDE.md` 只写一行导入语句 `@~/AGENTS.md`。Claude Code 会把已经导入过的文件按路径去重，所以只加载一份；项目自带 `CLAUDE.md` 或工作目录不在家目录下时，也照样能通过导入读到 prompt。`promptsync status` 会把这一项标为 `(imports ~/AGENTS.md)`。
+  - 自动判断方式：读取本机 Cindy 应用包（macOS `/Applications/Cindy.app/Contents/Resources/app.asar`；Windows `%LOCALAPPDATA%\Programs\Cindy\resources\app.asar`；Linux `/opt/Cindy/resources/app.asar` 等），看里面有没有读取 Pi 全局指令目录的代码。结果按文件大小和修改时间缓存，Cindy 升级后会自动重新判断。找不到应用包时按旧版处理（依旧不会重复加载）。也可以在 `[sync]` 里用 `cindy_pi = "pi-agent"` / `"home"` 强制指定。
   - **Codex 任务**读 `CindyGlobal/codex-home/AGENTS.md`；Cindy 只在**启动时**从 `~/.codex/AGENTS.md` 复制一次，所以这里直接同步副本，新任务无需重启 Cindy。
   - **Claude Code 任务**读 `~/.claude/CLAUDE.md`。
   - Cindy「设置 › 个性化 › 自定义提示词」会追加到每个 Cindy 任务末尾，但存在 Cindy 内部，promptsync 不改它；建议留空或只写与同步 prompt 不冲突的内容。
@@ -460,6 +471,7 @@ keep_backups = 10
 follow_symlinks = false
 delete_removed = false     # 源集合变小时不删除 agent 上旧文件
 adapt_clients = true       # 自动适配本机 Codex/Claude/Kimi/DeepSeek/Cindy 的指令文件
+cindy_pi = "auto"          # Cindy Pi 任务的指令位置：auto / pi-agent / home（每个引擎只加载一份）
 adapt_paths = []           # 额外目标文件（绝对路径或 ~/...）
 
 [[sync.sources]]
@@ -484,7 +496,8 @@ globs = ["*/bots/*/system_prompt.md"]
   - server：`agents.json`（每个 agent 的最后心跳/告警状态）
   - agent：`agent-state.json`（最后成功时间、服务端/本地 hash、失败次数、最近错误）
 - 备份：agent 每次覆盖前把旧文件放到 `config/state/backups/<UTC 时间戳>/<source id>/...`，默认保留 10 份。
-- 客户端适配备份：覆盖 `~/.codex/AGENTS.md` 等文件前，在同目录生成 `<文件名>.<UTC 时间>.bak`，保留 `sync.keep_backups` 份。
+- 客户端适配备份：覆盖 `~/.codex/AGENTS.md` 等文件前，旧内容存入 `config/state/client-backups/`（按内容去重；原始文件永不清理，其余每个文件保留 `sync.keep_backups` 份），用 `promptsync backups` 查看。
+- 服务端飞书覆盖的备份：只有一个受管文件，备份在它同目录的 `<文件名>.<UTC 时间>.bak`（见第 5 节）。
 - 查看：`promptsync status`（人类可读）或 `promptsync status --json`。
 - 只读命令（`status` / `ports` / `config-file` / `feishu-test`）**不会创建配置**：目标目录没有 `config.toml` 时直接报 `no config file at ...`，避免在错误的工作目录里生成新的集群密钥。
 
@@ -600,6 +613,7 @@ cargo fmt --check
 | `src/adapters.rs` | 把同步到的 prompt 适配到 Codex/Claude/Kimi/DeepSeek/Cindy 的指令文件 |
 | `src/prompts.rs` | glob 扫描、canonical hash、原子写入/备份/删除 |
 | `src/feishu.rs` | 飞书自建应用客户端（token、收发消息、绑定查询） |
+| `src/client_backups.rs` | 客户端指令文件的集中备份库（去重、原始文件永久保留、旧 .bak 迁移） |
 | `src/feishu_control.rs` | 绑定流程、私聊轮询、单文件覆盖 + .bak 备份 |
 | `src/logx.rs` | 轮转日志 |
 

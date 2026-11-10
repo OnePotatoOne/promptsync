@@ -482,6 +482,31 @@ fn log_adapted(report: &crate::adapters::AdaptReport, logger: &Logger) {
             path.display()
         ));
     }
+    // 旧位置是用户自己的文件，没有移走：提醒对应引擎可能会加载两份指令。
+    for (client, path) in &report.kept {
+        logger.warn(format!(
+            "client prompt for {client}: {} is not a promptsync copy, left untouched; {client} may load two instruction files (remove it by hand if that is not intended)",
+            path.display()
+        ));
+    }
+    // 迁入集中备份库的旧 .bak 文件：逐个说明去向。
+    for (old, entry) in &report.migrated {
+        logger.info(format!(
+            "client backup: moved {} into the backup store ({}, {} B, {:?})",
+            old.display(),
+            entry.id,
+            entry.bytes,
+            entry.kind
+        ));
+    }
+    // 被移走的旧副本：告诉用户备份在哪里。
+    for (client, path, backup) in &report.retired {
+        logger.info(format!(
+            "client prompt for {client}: moved duplicate {} to {}",
+            path.display(),
+            backup.display()
+        ));
+    }
     if report.has_changes() {
         logger.info(format!("client prompts: {}", report.summary()));
     } else if !report.is_empty() {
@@ -649,7 +674,8 @@ pub async fn sync_once(
     {
         // Keep client configs current even when the prompt itself did not
         // change (e.g. a new client was installed after the last pull).
-        let adapted = crate::adapters::apply_bundle(&config.sync, &local_entries, &manifest.target);
+        let adapted =
+            crate::adapters::apply_bundle(&config.sync, &local_entries, &manifest.target, data_dir);
         log_adapted(&adapted, logger);
         send_bye(&mut channel, agent_id, &manifest.hash).await;
         return Ok(SyncOutcome::UpToDate {
@@ -760,7 +786,8 @@ pub async fn sync_once(
         config.sync.delete_removed,
         logger,
     )?;
-    let adapted = crate::adapters::apply_bundle(&config.sync, &applicable, &manifest.target);
+    let adapted =
+        crate::adapters::apply_bundle(&config.sync, &applicable, &manifest.target, data_dir);
     log_adapted(&adapted, logger);
     // Re-scan instead of hashing `applicable`: local sources may hold files the
     // server does not publish, and an adapter may have rewritten a file inside

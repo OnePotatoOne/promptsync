@@ -113,19 +113,29 @@ delete_removed = false
 #   claude      <CLAUDE_CONFIG_DIR|~/.claude>/CLAUDE.md（终端 + Cindy 的 Claude Code 任务）
 #   codex       <CODEX_HOME|~/.codex>/AGENTS.md
 #   cindy-codex CindyGlobal/codex-home/AGENTS.md（Cindy 的 Codex 任务；不用重启 Cindy）
-#   cindy-pi    ~/AGENTS.md（Cindy 的 Pi 任务：对话 + 项目。Pi 会读工作目录及所有父目录的 AGENTS.md）
+#   cindy-pi    Cindy 的 Pi 任务（对话 + 项目）。位置由下面的 cindy_pi 决定：
+#               新版 Cindy 写 <PI_CODING_AGENT_DIR|~/.pi/agent>/AGENTS.md；
+#               旧版 Cindy 写 ~/AGENTS.md，同时让 claude 的 CLAUDE.md 只导入它（@~/AGENTS.md）
 #   kimi        <KIMI_CODE_HOME|~/.kimi-code>/AGENTS.md
 #   deepseek    <DSH_HOME|~/.dsh>/AGENTS.md
 #   gemini      ~/.gemini/GEMINI.md      qwen ~/.qwen/QWEN.md
 #   opencode    <XDG_CONFIG_HOME|~/.config>/opencode/AGENTS.md
 #   pi          <PI_CODING_AGENT_DIR|~/.pi/agent>/AGENTS.md（独立 Pi；装了 Cindy 时改由 cindy-pi 覆盖）
 #   cindy       CindyGlobal/owners/*/bots/cindy-default/SOUL.md（伙伴/IM 对话的身份）
-# 备份为同目录的 <文件名>.<UTC 时间>.bak，保留份数见 keep_backups。
+# 旧内容统一备份到 <状态目录>/client-backups/（按内容去重，`promptsync backups` 查看）：
+# 原始文件（第一次接管前的内容）永不清理，其他备份每个文件保留 keep_backups 份。
 adapt_clients = true
 # 额外目标文件（绝对路径或 ~/...），用于上面没覆盖的客户端。
 adapt_paths = []
-# 不想写的客户端 id，例如不想在家目录放 AGENTS.md：adapt_exclude = ["cindy-pi"]
+# 不想写的客户端 id，例如不想管理 Cindy 的 Pi 任务：adapt_exclude = ["cindy-pi"]
 adapt_exclude = []
+# Cindy 的 Pi 任务从哪里读 prompt：
+#   "auto"     检查本机 Cindy 应用是否支持 Pi 全局指令目录，自动选择（推荐）
+#   "pi-agent" 强制写 <PI_CODING_AGENT_DIR|~/.pi/agent>/AGENTS.md
+#   "home"     强制写 ~/AGENTS.md（旧版 Cindy）
+# 每个引擎只加载一份 prompt：另一个位置上由 promptsync 写入的旧副本会存入备份库后移走，
+# 用户自己写的文件不会动。
+cindy_pi = "auto"
 
 # 同步源：bundle 中的路径为 <id>/<相对路径>，所以各机器 home 不同也能对应上。
 [[sync.sources]]

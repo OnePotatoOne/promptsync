@@ -83,6 +83,12 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// List the central backups of client instruction files
+    /// (`<state>/client-backups`) and old `.bak` files not migrated yet
+    Backups {
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the derived data/knock ports and the secret fingerprint
     Ports,
     /// Show, generate or set the cluster secret
@@ -137,7 +143,11 @@ async fn dispatch(cli: Cli) -> Result<u8> {
     // secret) in whatever directory the command happened to run from.
     let needs_existing_config = matches!(
         cli.command,
-        Command::Status { .. } | Command::Ports | Command::ConfigFile | Command::FeishuTest { .. }
+        Command::Status { .. }
+            | Command::Backups { .. }
+            | Command::Ports
+            | Command::ConfigFile
+            | Command::FeishuTest { .. }
     );
     if needs_existing_config && !paths.config_file.exists() {
         bail!(
@@ -300,6 +310,7 @@ async fn dispatch(cli: Cli) -> Result<u8> {
             Ok(0)
         }
         Command::Status { json } => status(&config, &paths, *json),
+        Command::Backups { json } => backups(&config, &paths, *json),
         Command::Ports => ports(&config, &paths),
         Command::Secret {
             show,
@@ -596,7 +607,15 @@ fn status(config: &Config, paths: &Paths, json: bool) -> Result<u8> {
     let sources = resolve_sources(&config.sync);
     let options = ScanOptions::from(&config.sync);
     let entries = scan(&sources, &options, None)?;
-    let client_files = promptsync::adapters::detect(&config.sync);
+    // 完整适配计划：要写入的客户端文件 + 可能造成重复加载的旧副本位置。
+    let client_plan = promptsync::adapters::plan(&config.sync);
+    let client_files = &client_plan.adapters;
+    // 旧位置上确实还有文件的，才值得在 status 里提示。
+    let duplicates: Vec<_> = client_plan
+        .retire
+        .iter()
+        .filter(|old| old.path.is_file())
+        .collect();
     let hash = canonical_hash(&entries);
     let bytes = total_bytes(&entries);
     let data_dir = paths.data_dir();
@@ -654,6 +673,13 @@ fn status(config: &Config, paths: &Paths, json: bool) -> Result<u8> {
                     "id": adapter.id,
                     "path": adapter.path.display().to_string(),
                     "exists": adapter.path.is_file(),
+                    // 非空时该文件只写一行导入语句，导入的目标文件。
+                    "imports": adapter.import,
+                })).collect::<Vec<_>>(),
+                // 下次同步时会检查的旧副本（是同步副本就备份移走，否则保留并告警）。
+                "duplicates": duplicates.iter().map(|old| serde_json::json!({
+                    "id": old.id,
+                    "path": old.path.display().to_string(),
                 })).collect::<Vec<_>>(),
             },
         });
@@ -758,17 +784,129 @@ fn status(config: &Config, paths: &Paths, json: bool) -> Result<u8> {
                 format!("{} detected", client_files.len())
             }
         );
-        for adapter in &client_files {
+        for adapter in client_files {
             println!(
-                "  {:<16} {}{}",
+                "  {:<16} {}{}{}",
                 adapter.id,
                 adapter.path.display(),
                 if adapter.path.is_file() {
                     ""
                 } else {
                     "  (new)"
-                }
+                },
+                // 导入语句文件：说明它引用的是哪个文件，而不是 prompt 正文。
+                adapter
+                    .import
+                    .as_ref()
+                    .map(|target| format!("  (imports {target})"))
+                    .unwrap_or_default()
             );
+        }
+        // 客户端文件的旧内容统一备份在这里（`promptsync backups` 查看详情）。
+        println!(
+            "  {:<16} {}  (`promptsync backups` lists them)",
+            "backups",
+            paths
+                .data_dir()
+                .join(promptsync::client_backups::DIR_NAME)
+                .display()
+        );
+        // 旧位置上的文件会让同一个引擎读到两份 prompt。
+        for old in &duplicates {
+            println!(
+                "  {:<16} {}  (duplicate: moved away on the next sync if it is a promptsync copy)",
+                old.id,
+                old.path.display()
+            );
+        }
+    }
+    Ok(0)
+}
+
+/// `promptsync backups`：列出集中备份库里的备份，以及客户端目录里还没迁移的旧 `.bak`。
+///
+/// 参数：`config` 当前配置；`paths` 配置/状态目录；`json` 为 true 时输出 JSON。
+/// 只读，不改动任何文件（迁移由 agent 在下一次同步时完成）。
+fn backups(config: &Config, paths: &Paths, json: bool) -> Result<u8> {
+    use promptsync::client_backups::{BackupStore, Kind};
+    let data_dir = paths.data_dir();
+    // 集中备份库及其全部记录。
+    let store = BackupStore::new(&data_dir);
+    let entries = store.entries();
+    // 客户端目录里还留着的旧备份（演练，不改动文件）。
+    let pending = promptsync::adapters::pending_migration(&config.sync, &data_dir);
+    if json {
+        // 把一条记录转换成 JSON（附带内容文件路径）。
+        let entry_json = |entry: &promptsync::client_backups::Entry| {
+            serde_json::json!({
+                "time": entry.time,
+                "id": entry.id,
+                "path": entry.path,
+                "kind": entry.kind,
+                "bytes": entry.bytes,
+                "sha256": entry.sha256,
+                "file": store.blob_path(entry).display().to_string(),
+            })
+        };
+        let payload = serde_json::json!({
+            "store": store.root().display().to_string(),
+            "entries": entries.iter().map(entry_json).collect::<Vec<_>>(),
+            "pending_migration": pending.iter().map(|(old, entry)| serde_json::json!({
+                "file": old.display().to_string(),
+                "kind": entry.kind,
+                "path": entry.path,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(0);
+    }
+    println!("backup store   {}", store.root().display());
+    if entries.is_empty() {
+        println!("  (empty)");
+    }
+    // 先列原始文件（永不自动清理），再按时间从新到旧列其他备份。
+    let originals: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.kind == Kind::Original)
+        .collect();
+    let others: Vec<_> = entries
+        .iter()
+        .rev()
+        .filter(|entry| entry.kind != Kind::Original)
+        .collect();
+    for (title, group) in [
+        (
+            "原始文件（promptsync 接管前的内容，永不自动清理）",
+            originals,
+        ),
+        (
+            "其他备份（从新到旧，每个文件保留 sync.keep_backups 份）",
+            others,
+        ),
+    ] {
+        if group.is_empty() {
+            continue;
+        }
+        println!("{title}");
+        for entry in group {
+            println!(
+                "  {}  {:<12} {:<10} {:>6} B  {}",
+                entry.time,
+                entry.id,
+                entry.kind.label(),
+                entry.bytes,
+                entry.path
+            );
+            println!("      -> {}", store.blob_path(entry).display());
+        }
+    }
+    if !pending.is_empty() {
+        println!(
+            "待迁移的旧备份（{} 个，agent 下一次同步时移入备份库）",
+            pending.len()
+        );
+        for (old, entry) in &pending {
+            println!("  {}  [{}]", old.display(), entry.kind.label());
         }
     }
     Ok(0)

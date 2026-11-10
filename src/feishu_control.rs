@@ -531,8 +531,12 @@ pub async fn run(
         let config = config.clone();
         let snapshot = cursor.clone();
         let status = Arc::clone(&status);
+        // 状态目录：客户端适配时的集中备份库放在这里。
+        let state_dir = data_dir.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            poll_once(&config, &client, &binding, &target, &snapshot, &status)
+            poll_once(
+                &config, &client, &binding, &target, &snapshot, &status, &state_dir,
+            )
         })
         .await;
         match outcome {
@@ -662,6 +666,7 @@ fn poll_once(
     target: &TargetFile,
     cursor: &Cursor,
     status: &StatusProvider,
+    data_dir: &Path,
 ) -> Result<PollOutcome> {
     let mut cursor = cursor.clone();
     let now = now_unix();
@@ -706,7 +711,7 @@ fn poll_once(
             continue;
         }
 
-        let reply = match apply_message(config, client, binding, target, &message) {
+        let reply = match apply_message(config, client, binding, target, &message, data_dir) {
             Ok(Applied::Ignored { reason }) => {
                 cursor.record(&message.id, message.create_time_ms);
                 reason
@@ -835,6 +840,7 @@ fn apply_message(
     _binding: &Binding,
     target: &TargetFile,
     message: &feishu::Message,
+    data_dir: &Path,
 ) -> Result<Applied> {
     let text = match message_text(message) {
         Some(text) => text,
@@ -899,15 +905,23 @@ fn apply_message(
     }
     atomic_write(&target.path, content.as_bytes(), true)
         .with_context(|| format!("writing {}", target.path.display()))?;
-    let adapted = crate::adapters::apply_content(&config.sync, content.as_bytes());
+    // 服务端本机的客户端也立即适配；旧内容备份到状态目录的集中备份库。
+    let adapted = crate::adapters::apply_content(&config.sync, content.as_bytes(), data_dir);
     Ok(Applied::Written {
         bytes,
         hash,
         backup,
+        // 已更新的客户端，加上被移走旧副本的客户端（标注“移走重复”）。
         adapted: adapted
             .written
             .into_iter()
             .map(|(client, _, _)| client)
+            .chain(
+                adapted
+                    .retired
+                    .into_iter()
+                    .map(|(client, path, _)| format!("{client}(移走重复 {})", path.display())),
+            )
             .collect(),
         adapt_errors: adapted
             .failed
@@ -1177,8 +1191,16 @@ mod tests {
         mock.push_text("new prompt\nsecond line", "ou_owner");
         let (config, _temp, target, binding, cursor) = fixture(&mock);
         let client = FeishuClient::new(&config.feishu.app, Duration::from_secs(5)).unwrap();
-        let outcome =
-            poll_once(&config, &client, &binding, &target, &cursor, &no_status()).unwrap();
+        let outcome = poll_once(
+            &config,
+            &client,
+            &binding,
+            &target,
+            &cursor,
+            &no_status(),
+            target.path.parent().unwrap(),
+        )
+        .unwrap();
 
         let content = fs::read_to_string(&target.path).unwrap();
         assert_eq!(content, "new prompt\nsecond line\n");
@@ -1222,7 +1244,16 @@ mod tests {
             ..Default::default()
         });
 
-        let outcome = poll_once(&config, &client, &binding, &target, &cursor, &status).unwrap();
+        let outcome = poll_once(
+            &config,
+            &client,
+            &binding,
+            &target,
+            &cursor,
+            &status,
+            target.path.parent().unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(&target.path).unwrap(), before);
         let acks = mock.acks();
@@ -1239,8 +1270,16 @@ mod tests {
         mock.push_text("from a stranger", "ou_someone");
         let (mut config, _temp, target, binding, cursor) = fixture(&mock);
         let client = FeishuClient::new(&config.feishu.app, Duration::from_secs(5)).unwrap();
-        let outcome =
-            poll_once(&config, &client, &binding, &target, &cursor, &no_status()).unwrap();
+        let outcome = poll_once(
+            &config,
+            &client,
+            &binding,
+            &target,
+            &cursor,
+            &no_status(),
+            target.path.parent().unwrap(),
+        )
+        .unwrap();
         assert_eq!(fs::read_to_string(&target.path).unwrap(), "old prompt\n");
         assert!(outcome.log_message.is_none());
 
@@ -1254,8 +1293,16 @@ mod tests {
             "sender": { "id": "ou_owner", "sender_type": "user" },
             "chat_id": "oc_p2p",
         }));
-        let outcome =
-            poll_once(&config, &client, &binding, &target, &cursor, &no_status()).unwrap();
+        let outcome = poll_once(
+            &config,
+            &client,
+            &binding,
+            &target,
+            &cursor,
+            &no_status(),
+            target.path.parent().unwrap(),
+        )
+        .unwrap();
         assert!(outcome.log_message.is_none());
         assert_eq!(fs::read_to_string(&target.path).unwrap(), "old prompt\n");
         assert!(mock.acks().iter().any(|ack| ack.contains("纯文本")));
@@ -1264,7 +1311,16 @@ mod tests {
         config.feishu.control.dry_run = true;
         mock.messages.lock().unwrap().clear();
         mock.push_text("dry run content", "ou_owner");
-        let _ = poll_once(&config, &client, &binding, &target, &cursor, &no_status()).unwrap();
+        let _ = poll_once(
+            &config,
+            &client,
+            &binding,
+            &target,
+            &cursor,
+            &no_status(),
+            target.path.parent().unwrap(),
+        )
+        .unwrap();
         assert_eq!(fs::read_to_string(&target.path).unwrap(), "old prompt\n");
         assert!(mock.acks().iter().any(|ack| ack.contains("dry-run")));
     }
@@ -1276,8 +1332,16 @@ mod tests {
         let (config, _temp, target, binding, cursor) = fixture(&mock);
         let client = FeishuClient::new(&config.feishu.app, Duration::from_secs(5)).unwrap();
         let before = fs::metadata(&target.path).unwrap().modified().unwrap();
-        let outcome =
-            poll_once(&config, &client, &binding, &target, &cursor, &no_status()).unwrap();
+        let outcome = poll_once(
+            &config,
+            &client,
+            &binding,
+            &target,
+            &cursor,
+            &no_status(),
+            target.path.parent().unwrap(),
+        )
+        .unwrap();
         assert!(outcome.log_message.is_none());
         assert_eq!(
             fs::metadata(&target.path).unwrap().modified().unwrap(),
@@ -1293,8 +1357,16 @@ mod tests {
         let (mut config, _temp, target, binding, cursor) = fixture(&mock);
         config.feishu.control.max_message_bytes = 1024;
         let client = FeishuClient::new(&config.feishu.app, Duration::from_secs(5)).unwrap();
-        let outcome =
-            poll_once(&config, &client, &binding, &target, &cursor, &no_status()).unwrap();
+        let outcome = poll_once(
+            &config,
+            &client,
+            &binding,
+            &target,
+            &cursor,
+            &no_status(),
+            target.path.parent().unwrap(),
+        )
+        .unwrap();
         assert_eq!(fs::read_to_string(&target.path).unwrap(), "old prompt\n");
         assert!(outcome.log_message.unwrap().contains("rejected"));
         assert!(mock.acks().iter().any(|ack| ack.contains("超过上限")));
@@ -1329,7 +1401,16 @@ mod tests {
         fs::create_dir_all(&target.path).unwrap();
         let client = FeishuClient::new(&config.feishu.app, Duration::from_secs(5)).unwrap();
 
-        let first = poll_once(&config, &client, &binding, &target, &cursor, &no_status()).unwrap();
+        let first = poll_once(
+            &config,
+            &client,
+            &binding,
+            &target,
+            &cursor,
+            &no_status(),
+            target.path.parent().unwrap(),
+        )
+        .unwrap();
         assert!(!first.cursor.seen("m-0"));
         assert_eq!(first.cursor.failures.get("m-0").copied(), Some(1));
         assert!(first.log_message.as_deref().unwrap().contains("will retry"));
@@ -1341,6 +1422,7 @@ mod tests {
             &target,
             &first.cursor,
             &no_status(),
+            target.path.parent().unwrap(),
         )
         .unwrap();
         assert!(!second.cursor.seen("m-0"));
@@ -1351,6 +1433,7 @@ mod tests {
             &target,
             &second.cursor,
             &no_status(),
+            target.path.parent().unwrap(),
         )
         .unwrap();
         assert!(third.cursor.seen("m-0"));
