@@ -156,8 +156,8 @@ pub struct SyncConfig {
     /// Off by default: shrinking the source set never removes user files.
     pub delete_removed: bool,
     /// Copy the synced prompt into the global instruction file of every
-    /// detected coding agent (Claude, Codex, Kimi, DeepSeek, Gemini, Qwen,
-    /// opencode, Pi and Cindy's Pi/Codex tasks).
+    /// detected coding agent (Claude, Codex, Kimi, DeepSeek, Antigravity, agy,
+    /// Gemini, Qwen, opencode, Pi and Cindy's Pi/Codex tasks).
     pub adapt_clients: bool,
     /// Extra instruction files to update, on top of the auto-detected ones.
     /// Absolute paths or `~/...`.

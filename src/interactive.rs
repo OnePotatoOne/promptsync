@@ -858,7 +858,7 @@ fn print_summary(config: &Config, paths: &Paths, role: Role) {
                     adapters.len(),
                     adapters
                         .iter()
-                        .map(|adapter| adapter.id.as_str())
+                        .map(|adapter| adapter.label())
                         .collect::<Vec<_>>()
                         .join(", ")
                 )

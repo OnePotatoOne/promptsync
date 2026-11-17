@@ -671,6 +671,7 @@ fn status(config: &Config, paths: &Paths, json: bool) -> Result<u8> {
                 "enabled": config.sync.adapt_clients,
                 "targets": client_files.iter().map(|adapter| serde_json::json!({
                     "id": adapter.id,
+                    "also_covers": adapter.also_covers,
                     "path": adapter.path.display().to_string(),
                     "exists": adapter.path.is_file(),
                     // 非空时该文件只写一行导入语句，导入的目标文件。
@@ -786,13 +787,19 @@ fn status(config: &Config, paths: &Paths, json: bool) -> Result<u8> {
         );
         for adapter in client_files {
             println!(
-                "  {:<16} {}{}{}",
+                "  {:<16} {}{}{}{}",
                 adapter.id,
                 adapter.path.display(),
                 if adapter.path.is_file() {
                     ""
                 } else {
                     "  (new)"
+                },
+                // 共用同一全局指令文件的其他已安装客户端（如 antigravity 与 agy）。
+                if adapter.also_covers.is_empty() {
+                    String::new()
+                } else {
+                    format!("  (also covers: {})", adapter.also_covers.join(", "))
                 },
                 // 导入语句文件：说明它引用的是哪个文件，而不是 prompt 正文。
                 adapter

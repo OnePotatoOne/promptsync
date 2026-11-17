@@ -10,7 +10,7 @@
 - 传输走 **UDP**：先做**随机端口敲门**，敲门成功前数据端口根本不绑定；握手用 **X25519 + 预共享密钥认证**，数据用 **AES-256-GCM**，带防重放窗口。
 - 连续 **2 分钟**失联自动通过**飞书自建应用**发离线告警（恢复后可选恢复通知）；agent 与 server 使用同一个飞书应用时，会自动继承 server 的告警接收人，不用手动粘贴 `open_id`。
 - 绑定后可以直接给机器人**私聊发纯文本**，服务端自动覆盖唯一那个 prompt 文件，agent 再自动同步。
-- agent 拉取后**自动适配本机客户端**：Codex、Claude Code、Kimi、DeepSeek、Cindy 的全局指令文件一起更新，覆盖前自动备份。
+- agent 拉取后**自动适配本机客户端**：Codex、Claude Code、Antigravity（桌面端 / IDE + `agy` CLI）、Gemini CLI、Kimi、DeepSeek、Cindy 等全局指令文件一起更新，覆盖前自动备份。
 - **首次启动自动生成随机集群密钥**并写入本机配置（同时打印一次）；仓库和发布产物里没有固定密钥。其他机器用同一串密钥或同一句口令对齐。
 - **个人配置集中在一个目录**（默认 `./config`，空目录启动时自动从模板生成，整个目录被 git 忽略；当前目录本身就是配置目录（里面直接有 `config.toml`）时直接用当前目录；当前目录还没有配置、而 `~/.promptsync/config.toml` 已存在时会直接复用它，避免换目录启动生成第二份密钥）。
 - 单文件 Rust 二进制，本地编译；GitHub Actions 交叉编译各平台裸二进制。
@@ -194,7 +194,9 @@ agent 把拉到的 prompt 再写进本机**已安装**客户端的全局指令�
 | `cindy-pi` | Cindy 的 Pi 任务（**对话会话** + 项目会话） | 新版 Cindy：`~/.pi/agent/AGENTS.md`；旧版：`~/AGENTS.md`（自动判断，见下文） | `PI_CODING_AGENT_DIR` |
 | `kimi` | Kimi Code | `~/.kimi-code/AGENTS.md` | `KIMI_CODE_HOME` |
 | `deepseek` | DeepSeek Harness | `~/.dsh/AGENTS.md` | `DSH_HOME` |
-| `gemini` | Gemini CLI | `~/.gemini/GEMINI.md` | — |
+| `antigravity` | Google Antigravity 客户端（Antigravity 2.0 桌面端、Antigravity IDE、远程 SSH 服务端） | `~/.gemini/GEMINI.md` | — |
+| `agy` | Google Antigravity CLI（`agy` 终端命令行；与 `antigravity` 同机安装时共用同一文件，只写一份） | `~/.gemini/GEMINI.md` | — |
+| `gemini` | Gemini CLI（未设 `GEMINI_CLI_HOME` 且装了 Antigravity/`agy` 时共用 `~/.gemini/GEMINI.md`） | `~/.gemini/GEMINI.md` | `GEMINI_CLI_HOME` |
 | `qwen` | Qwen Code | `~/.qwen/QWEN.md` | — |
 | `opencode` | opencode | `~/.config/opencode/AGENTS.md` | `XDG_CONFIG_HOME` |
 | `pi` | 独立安装的 Pi（装了 Cindy 时由 `cindy-pi` 覆盖，不重复写） | `~/.pi/agent/AGENTS.md` | `PI_CODING_AGENT_DIR` |
@@ -223,6 +225,11 @@ agent 把拉到的 prompt 再写进本机**已安装**客户端的全局指令�
   - **Claude Code 任务**读 `~/.claude/CLAUDE.md`。
   - Cindy「设置 › 个性化 › 自定义提示词」会追加到每个 Cindy 任务末尾，但存在 Cindy 内部，promptsync 不改它；建议留空或只写与同步 prompt 不冲突的内容。
   - 改动只对**新建**的任务生效，已经开着的会话保留启动时的指令。
+- **Antigravity 客户端与 `agy` CLI 的全局规则机制**：
+  - Antigravity 2.0 桌面端、Antigravity IDE 和 `agy` CLI 共享同一套全局规则引擎（`cortex/customizations`），默认都读取 `~/.gemini/GEMINI.md`（单文件上限 24 KB）。
+  - 无论是已运行生成的 `~/.gemini/antigravity`、`~/.gemini/antigravity-ide`、`~/.gemini/antigravity-cli`、`~/.gemini/config`，还是刚安装好应用包（如 `/Applications/Antigravity.app`）或执行完官方 CLI 安装脚本（`~/.local/bin/agy`、`PATH` 中的 `agy`）而尚未首次启动创建 `~/.gemini`，都会被自动识别并写入 `~/.gemini/GEMINI.md`。
+  - 该引擎还会把 `~/.gemini/AGENTS.md`、`~/.gemini/config/GEMINI.md`、`~/.gemini/config/AGENTS.md` 叠加加载（按文件路径去重，不按内容去重）：如果这些位置留有 `promptsync` 同步过的旧副本，会自动备份移走，避免客户端和 `agy` 重复加载两份 prompt；你手写的其他规则文件保持不动。
+  - 同机同时安装 Antigravity 客户端与 `agy` CLI 时，`promptsync status` 会显示 `(also covers: agy)`，日志和飞书回执显示 `antigravity+agy`。
 - `promptsync status` 会列出当前识别到的客户端文件。
 
 ---
@@ -470,7 +477,7 @@ max_bundle_bytes = 1048576
 keep_backups = 10
 follow_symlinks = false
 delete_removed = false     # 源集合变小时不删除 agent 上旧文件
-adapt_clients = true       # 自动适配本机 Codex/Claude/Kimi/DeepSeek/Cindy 的指令文件
+adapt_clients = true       # 自动适配本机 Codex/Claude/Antigravity/agy/Kimi/DeepSeek/Cindy 的指令文件
 cindy_pi = "auto"          # Cindy Pi 任务的指令位置：auto / pi-agent / home（每个引擎只加载一份）
 adapt_paths = []           # 额外目标文件（绝对路径或 ~/...）
 

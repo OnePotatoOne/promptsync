@@ -118,7 +118,10 @@ delete_removed = false
 #               旧版 Cindy 写 ~/AGENTS.md，同时让 claude 的 CLAUDE.md 只导入它（@~/AGENTS.md）
 #   kimi        <KIMI_CODE_HOME|~/.kimi-code>/AGENTS.md
 #   deepseek    <DSH_HOME|~/.dsh>/AGENTS.md
-#   gemini      ~/.gemini/GEMINI.md      qwen ~/.qwen/QWEN.md
+#   antigravity ~/.gemini/GEMINI.md（Antigravity 客户端：2.0 桌面端 / IDE / 远端服务）
+#   agy         ~/.gemini/GEMINI.md（Antigravity CLI；与 antigravity 同机安装时只写一份）
+#   gemini      <GEMINI_CLI_HOME|~>/.gemini/GEMINI.md（Gemini CLI）
+#   qwen        ~/.qwen/QWEN.md
 #   opencode    <XDG_CONFIG_HOME|~/.config>/opencode/AGENTS.md
 #   pi          <PI_CODING_AGENT_DIR|~/.pi/agent>/AGENTS.md（独立 Pi；装了 Cindy 时改由 cindy-pi 覆盖）
 #   cindy       CindyGlobal/owners/*/bots/cindy-default/SOUL.md（伙伴/IM 对话的身份）

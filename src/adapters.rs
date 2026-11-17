@@ -17,16 +17,41 @@ use crate::client_backups::{synced_versions, BackupStore, Imported};
 use crate::config::SyncConfig;
 use crate::util::{atomic_write, expand_tilde};
 
+/// 单个本机客户端全局指令文件的适配项。
 #[derive(Debug, Clone)]
 pub struct Adapter {
-    /// Short client id used in logs and `status` ("codex", "claude", ...).
+    /// 客户端短标识，用于日志、`status` 与备份清单（如 `"codex"`、`"claude"`、`"antigravity"`、`"agy"`）。
     pub id: String,
-    /// Instruction file the client reads.
+    /// 客户端读取的全局指令文件路径。
     pub path: PathBuf,
     /// `Some(目标)` 时这个文件不写 prompt 正文，而是写一行 Claude Code 导入语句
     /// `@目标`（目前只有旧版 Cindy 场景下的 `claude` 会用到，目标为 `~/AGENTS.md`）。
     /// Claude Code 会把导入的文件按路径去重，所以同一份 prompt 只加载一次。
     pub import: Option<String>,
+    /// 与 `id` 共用同一个 `path` 的其他已安装客户端 id（例如 `antigravity` 客户端与 `agy` CLI、
+    /// `gemini` CLI 共用 `~/.gemini/GEMINI.md`）：物理上只写一份，避免引擎重复加载。
+    pub also_covers: Vec<String>,
+}
+
+impl Adapter {
+    /// 生成用于日志、配置向导摘要与飞书回执的客户端展示标识。
+    ///
+    /// 参数：`&self` 为当前客户端适配项。
+    /// 返回值：无共享客户端时返回 `self.id`（如 `"antigravity"`、`"agy"`）；
+    /// 与其他已安装客户端共用同一文件时返回 `+` 拼接串（如 `"antigravity+agy"`）。
+    /// 调用示例：`let name = adapter.label();`
+    pub fn label(&self) -> String {
+        if self.also_covers.is_empty() {
+            self.id.clone()
+        } else {
+            let mut ids = Vec::with_capacity(1 + self.also_covers.len());
+            ids.push(self.id.as_str());
+            for extra in &self.also_covers {
+                ids.push(extra.as_str());
+            }
+            ids.join("+")
+        }
+    }
 }
 
 /// 一次适配要做的全部事情：要写入的客户端文件，以及要移走的旧副本。
@@ -180,35 +205,105 @@ pub fn detect(config: &SyncConfig) -> Vec<Adapter> {
     plan(config).adapters
 }
 
+/// 宿主机上不在家目录 `~` 下的客户端安装与环境变量探测结果。
+///
+/// 生产环境通过 [`ExternalClients::detect`] 读取真实系统安装目录、`PATH` 和环境变量；
+/// 单元测试传入 `ExternalClients::default()` 或手工构造的实例，确保测试与宿主机完全隔离、
+/// 且无需修改进程级环境变量。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ExternalClients {
+    /// 系统级安装目录（如 `/Applications/Antigravity.app`、`/opt/Antigravity`、
+    /// `%ProgramFiles%\Antigravity`）中存在 Antigravity 客户端（桌面应用或 IDE）。
+    antigravity_app: bool,
+    /// 系统 `PATH` 或系统级 `bin` 目录中存在可执行的 `agy` CLI。
+    agy_cli: bool,
+    /// `GEMINI_CLI_HOME` 环境变量指向的自定义根目录（Gemini CLI 在其下读取 `.gemini/GEMINI.md`）。
+    gemini_cli_home: Option<PathBuf>,
+    /// `XDG_CONFIG_HOME` 环境变量指向的自定义配置根目录。
+    xdg_config_home: Option<PathBuf>,
+}
+
+impl ExternalClients {
+    /// 探测当前宿主机上的系统级 Antigravity 客户端、`agy` CLI 及相关目录环境变量。
+    ///
+    /// 参数：无。
+    /// 返回值：包含系统级安装标志与已解析目录环境变量的 [`ExternalClients`]。
+    /// 调用示例：`let external = ExternalClients::detect();`
+    fn detect() -> Self {
+        Self {
+            antigravity_app: system_antigravity_installed(),
+            agy_cli: system_agy_cli_installed(),
+            gemini_cli_home: env_dir("GEMINI_CLI_HOME"),
+            xdg_config_home: env_dir("XDG_CONFIG_HOME"),
+        }
+    }
+}
+
 /// 计算本机的完整适配计划（要写哪些文件、要移走哪些旧副本）。
 ///
 /// 参数 `config` 是 `[sync]` 配置；只读取文件系统，不做任何修改。
+/// 返回值：包含目标文件、待归档重复副本与过期副本的 [`Plan`]。
 /// 调用示例：`let plan = adapters::plan(&config.sync);`
 pub fn plan(config: &SyncConfig) -> Plan {
     match dirs::home_dir() {
         Some(home) => {
             // Cindy 的 owners 目录，用来找伙伴的 SOUL.md。
             let owners = crate::config::cindy_owners_root();
+            // 探测家目录之外的系统级应用与 PATH。
+            let external = ExternalClients::detect();
             // 只有在真的需要自动判断时才去检查 Cindy 应用（读一个大文件）。
             let supported = || cindy_reads_pi_agent_dir(&home);
-            plan_with_roots(config, &home, owners.parent(), Some(&owners), supported)
+            plan_with_probes(
+                config,
+                &home,
+                owners.parent(),
+                Some(&owners),
+                &external,
+                supported,
+            )
         }
         None => Plan::default(),
     }
 }
 
-/// Detection with explicit roots so tests never touch the real machine.
+/// 使用显式根目录计算适配计划，默认不探测宿主机系统目录（供单元测试直接调用）。
 ///
-/// `home` is the user's home directory, `cindy_global` the `CindyGlobal`
-/// directory (None = Cindy not considered) and `cindy_owners` its `owners`
-/// directory used to find bot `SOUL.md` files. `pi_agent_supported` answers
-/// whether the installed Cindy copies the Pi global agent dir into its tasks;
-/// it is only called for `sync.cindy_pi = "auto"` when Cindy is installed.
+/// 参数：`config` 为 `[sync]` 配置；`home` 为模拟或真实家目录；`cindy_global` 为 `CindyGlobal`
+/// 目录（`None` 表示不考虑 Cindy）；`cindy_owners` 为 `owners` 目录；`pi_agent_supported`
+/// 返回本机 Cindy 是否支持复制 Pi 全局指令目录。
+/// 返回值：完整适配计划 [`Plan`]。
+/// 调用示例：`let plan = plan_with_roots(&config, home, None, None, || false);`
+#[cfg(test)]
 fn plan_with_roots(
     config: &SyncConfig,
     home: &Path,
     cindy_global: Option<&Path>,
     cindy_owners: Option<&Path>,
+    pi_agent_supported: impl FnOnce() -> bool,
+) -> Plan {
+    plan_with_probes(
+        config,
+        home,
+        cindy_global,
+        cindy_owners,
+        &ExternalClients::default(),
+        pi_agent_supported,
+    )
+}
+
+/// 使用显式根目录与外部探测结果计算完整适配计划，使单元测试完全不依赖真实宿主机。
+///
+/// 参数：`config` 为 `[sync]` 配置；`home` 为用户家目录；`cindy_global` 为 `CindyGlobal`
+/// 目录；`cindy_owners` 为其下 `owners` 目录；`external` 为系统级安装及环境变量探测结果；
+/// `pi_agent_supported` 为按需检测 Cindy 是否支持 Pi 全局指令目录的闭包。
+/// 返回值：完整适配计划 [`Plan`]。
+/// 调用示例：`let plan = plan_with_probes(&cfg, &home, None, None, &external, || false);`
+fn plan_with_probes(
+    config: &SyncConfig,
+    home: &Path,
+    cindy_global: Option<&Path>,
+    cindy_owners: Option<&Path>,
+    external: &ExternalClients,
     pi_agent_supported: impl FnOnce() -> bool,
 ) -> Plan {
     let mut adapters = Vec::new();
@@ -217,6 +312,20 @@ fn plan_with_roots(
     let mut retire = Vec::new();
     // 不再被任何引擎读取的过期副本。
     let mut stale = Vec::new();
+
+    // 判断某个 id 是否被 `sync.adapt_exclude` 关掉（忽略大小写和空格）。
+    let excluded = |id: &str| {
+        config
+            .adapt_exclude
+            .iter()
+            .any(|excluded| excluded.trim().eq_ignore_ascii_case(id))
+    };
+
+    // XDG 配置根目录：优先使用探测到的 `XDG_CONFIG_HOME`，否则默认 `~/.config`。
+    let xdg_config = external
+        .xdg_config_home
+        .clone()
+        .unwrap_or_else(|| home.join(".config"));
 
     // Kimi Code (`~/.kimi-code/AGENTS.md`).
     push_client(
@@ -250,13 +359,17 @@ fn plan_with_roots(
         env_dir("CLAUDE_CONFIG_DIR").unwrap_or_else(|| home.join(".claude")),
         "CLAUDE.md",
     );
-    // Gemini CLI (`~/.gemini/GEMINI.md`).
-    push_client(
+    // Antigravity 客户端（Antigravity 2.0 / IDE）、Antigravity CLI（`agy`）与 Gemini CLI：
+    // 三者默认共用 `~/.gemini/GEMINI.md`（同一个全局规则引擎），必须只写一份避免重复加载；
+    // 若 `GEMINI_CLI_HOME` 指向其他目录，则额外独立适配该目录下的 `.gemini/GEMINI.md`。
+    plan_gemini_ecosystem(
         &mut adapters,
         &mut seen,
-        "gemini",
-        home.join(".gemini"),
-        "GEMINI.md",
+        &mut retire,
+        home,
+        &xdg_config,
+        external,
+        &excluded,
     );
     // Qwen Code (`~/.qwen/QWEN.md`).
     push_client(
@@ -271,9 +384,7 @@ fn plan_with_roots(
         &mut adapters,
         &mut seen,
         "opencode",
-        env_dir("XDG_CONFIG_HOME")
-            .unwrap_or_else(|| home.join(".config"))
-            .join("opencode"),
+        xdg_config.join("opencode"),
         "AGENTS.md",
     );
 
@@ -325,6 +436,7 @@ fn plan_with_roots(
             id: "cindy-pi".to_string(),
             path: legacy,
             import: None,
+            also_covers: Vec::new(),
         });
         placement = Some(chosen);
         // promptsync 0.4.0 及更早版本写过 pi-agent-home/AGENTS.md，但 Cindy 的 Pi 任务
@@ -334,6 +446,7 @@ fn plan_with_roots(
                 id: "cindy-pi".to_string(),
                 path: global.join("pi-agent-home").join("AGENTS.md"),
                 import: None,
+                also_covers: Vec::new(),
             });
         }
     } else {
@@ -367,13 +480,6 @@ fn plan_with_roots(
         push_unique(&mut adapters, &mut seen, id, path);
     }
 
-    // 判断某个 id 是否被 `sync.adapt_exclude` 关掉（忽略大小写和空格）。
-    let excluded = |id: &str| {
-        config
-            .adapt_exclude
-            .iter()
-            .any(|excluded| excluded.trim().eq_ignore_ascii_case(id))
-    };
     // `sync.adapt_exclude` switches individual clients off by id.
     adapters.retain(|adapter| !excluded(&adapter.id));
     // 被排除的客户端连旧副本也不碰；仍然要写入的路径（例如 adapt_paths
@@ -536,6 +642,327 @@ fn stream_contains(mut reader: impl Read, needle: &[u8]) -> std::io::Result<bool
     }
 }
 
+/// 规划 Antigravity 客户端（Antigravity 2.0 / IDE / 远端服务）、Antigravity CLI（`agy`）
+/// 与 Gemini CLI 的全局指令文件写入及重复副本归档。
+///
+/// 背景（实测 Antigravity `cortex/customizations` 与 Gemini CLI）：
+/// 1. Antigravity 客户端（桌面端 `antigravity`、IDE `antigravity-ide`）与命令行 `agy`
+///    共享同一套全局规则引擎，都会读取 `~/.gemini/GEMINI.md`；
+/// 2. 该引擎还会叠加读取 `~/.gemini/AGENTS.md`、`~/.gemini/config/GEMINI.md` 和
+///    `~/.gemini/config/AGENTS.md`（按文件路径去重而非按内容去重），若多处留有同步副本，
+///    同一份 prompt 会被加载多次；
+/// 3. Gemini CLI 读取 `<GEMINI_CLI_HOME|~>/.gemini/GEMINI.md`，未设置 `GEMINI_CLI_HOME`
+///    时与 Antigravity / `agy` 指向同一个文件。
+///
+/// 参数：
+/// - `adapters`：输出的目标写入列表；
+/// - `seen`：已占用的目标路径集合，保证每个物理路径最多出现一次；
+/// - `retire`：输出的待检查重复副本列表；
+/// - `home`：用户家目录；
+/// - `xdg_config`：XDG 配置目录（`$XDG_CONFIG_HOME` 或 `~/.config`）；
+/// - `external`：系统级应用、`PATH` 与环境变量探测结果；
+/// - `excluded`：判断某个客户端 `id` 是否在 `sync.adapt_exclude` 中的闭包。
+///
+/// 返回值：无（结果直接追加到 `adapters` 与 `retire`）。
+/// 调用示例：`plan_gemini_ecosystem(&mut adapters, &mut seen, &mut retire, home, &xdg, ext, &excluded);`
+fn plan_gemini_ecosystem(
+    adapters: &mut Vec<Adapter>,
+    seen: &mut BTreeSet<PathBuf>,
+    retire: &mut Vec<Adapter>,
+    home: &Path,
+    xdg_config: &Path,
+    external: &ExternalClients,
+    excluded: &impl Fn(&str) -> bool,
+) {
+    let home_gemini_dir = home.join(".gemini");
+    // 检测 Antigravity 客户端（桌面端 / IDE / 远端）与 `agy` CLI。
+    let mut has_antigravity =
+        external.antigravity_app || antigravity_client_under(home, xdg_config);
+    let has_agy = external.agy_cli || agy_cli_under(home);
+    // `~/.gemini/config` 是 Antigravity 全局自定义目录；在只有该目录存在时归入 `antigravity`。
+    if !has_antigravity && !has_agy && home_gemini_dir.join("config").is_dir() {
+        has_antigravity = true;
+    }
+
+    // `GEMINI_CLI_HOME` 指向其他根目录时，Gemini CLI 使用独立的 `<GEMINI_CLI_HOME>/.gemini/GEMINI.md`。
+    let custom_gemini_dir = external
+        .gemini_cli_home
+        .as_ref()
+        .map(|base| base.join(".gemini"))
+        .filter(|dir| dir != &home_gemini_dir);
+    let has_shared_gemini = custom_gemini_dir.is_none()
+        && gemini_cli_under(&home_gemini_dir, has_antigravity || has_agy);
+
+    // 汇总所有共用 `~/.gemini/GEMINI.md` 的已安装客户端，优先级：antigravity -> agy -> gemini。
+    let mut shared_ids: Vec<&str> = Vec::new();
+    if has_antigravity {
+        shared_ids.push("antigravity");
+    }
+    if has_agy {
+        shared_ids.push("agy");
+    }
+    if has_shared_gemini {
+        shared_ids.push("gemini");
+    }
+
+    // 只要共享同一文件的任一已安装客户端被列入 `adapt_exclude`，就不能改动 `~/.gemini/GEMINI.md`，
+    // 否则被排除的引擎依然会读到同步的 prompt。
+    if !shared_ids.is_empty() && !shared_ids.iter().any(|id| excluded(id)) {
+        let primary = shared_ids[0].to_string();
+        let also_covers = shared_ids[1..]
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect::<Vec<_>>();
+        let target = home_gemini_dir.join("GEMINI.md");
+        if seen.insert(target.clone()) {
+            adapters.push(Adapter {
+                id: primary.clone(),
+                path: target,
+                import: None,
+                also_covers,
+            });
+        }
+        // Antigravity 客户端与 `agy` CLI 会把下面三个独立全局规则文件与 `~/.gemini/GEMINI.md`
+        // 叠加注入上下文：如果是同步副本就归档移走，用户手写规则则原样保留。
+        if has_antigravity || has_agy {
+            for duplicate in [
+                home_gemini_dir.join("AGENTS.md"),
+                home_gemini_dir.join("config").join("GEMINI.md"),
+                home_gemini_dir.join("config").join("AGENTS.md"),
+            ] {
+                retire.push(Adapter {
+                    id: primary.clone(),
+                    path: duplicate,
+                    import: None,
+                    also_covers: Vec::new(),
+                });
+            }
+        }
+    }
+
+    // `GEMINI_CLI_HOME` 指向独立目录时，单独为 Gemini CLI 维护那份 `GEMINI.md`。
+    if let Some(custom_dir) = custom_gemini_dir {
+        push_client(adapters, seen, "gemini", custom_dir, "GEMINI.md");
+    }
+}
+
+/// 检查用户家目录与 XDG 配置目录下是否存在 Antigravity 客户端（Antigravity 2.0、IDE 或远端服务）。
+///
+/// 参数：`home` 为用户家目录；`xdg_config` 为 XDG 配置目录（如 `~/.config`）。
+/// 返回值：检测到任一 Antigravity 客户端目录或用户级应用包时返回 `true`。
+/// 调用示例：`if antigravity_client_under(home, xdg_config) { ... }`
+fn antigravity_client_under(home: &Path, xdg_config: &Path) -> bool {
+    let gemini = home.join(".gemini");
+    // 跨平台运行态目录、SSH 远端目录、macOS / Windows 用户级安装与数据目录。
+    let home_dirs = [
+        gemini.join("antigravity"),
+        gemini.join("antigravity-ide"),
+        home.join(".antigravity-server"),
+        home.join(".antigravity-hub-server"),
+        home.join("Applications").join("Antigravity.app"),
+        home.join("Library")
+            .join("Application Support")
+            .join("Antigravity"),
+        home.join("AppData").join("Roaming").join("Antigravity"),
+        home.join("AppData")
+            .join("Local")
+            .join("Programs")
+            .join("Antigravity"),
+    ];
+    if home_dirs.iter().any(|dir| dir.is_dir()) {
+        return true;
+    }
+    // Linux 桌面端 / IDE 在 `$XDG_CONFIG_HOME` 下的配置目录。
+    [
+        xdg_config.join("Antigravity"),
+        xdg_config.join("antigravity"),
+    ]
+    .iter()
+    .any(|dir| dir.is_dir())
+}
+
+/// 检查用户家目录下是否存在 Antigravity CLI（`agy`）的配置目录或默认安装可执行文件。
+///
+/// 参数：`home` 为用户家目录。
+/// 返回值：检测到 `~/.gemini/antigravity-cli`、`~/.antigravity`、`~/.agy` 或家目录下的
+/// `agy` 可执行文件时返回 `true`（即使刚执行完官方安装脚本、尚未首次启动创建 `~/.gemini` 也能识别）。
+/// 调用示例：`if agy_cli_under(home) { ... }`
+fn agy_cli_under(home: &Path) -> bool {
+    let cli_dirs = [
+        home.join(".gemini").join("antigravity-cli"),
+        home.join(".antigravity"),
+        home.join(".agy"),
+    ];
+    if cli_dirs.iter().any(|dir| dir.is_dir()) {
+        return true;
+    }
+    // Unix 官方 install.sh 默认安装位置 `~/.local/bin/agy` 及 macOS 应用内附带目录。
+    let unix_bins = [
+        home.join(".local").join("bin").join("agy"),
+        home.join("Library")
+            .join("Application Support")
+            .join("Antigravity")
+            .join("bin")
+            .join("agy"),
+    ];
+    if unix_bins.iter().any(|bin| is_executable_file(bin)) {
+        return true;
+    }
+    // Windows 用户目录下的 `agy` 启动器。
+    for bin_dir in [
+        home.join(".local").join("bin"),
+        home.join("AppData")
+            .join("Local")
+            .join("Antigravity")
+            .join("bin"),
+        home.join("AppData")
+            .join("Local")
+            .join("Programs")
+            .join("Antigravity")
+            .join("bin"),
+    ] {
+        for name in ["agy.exe", "agy.cmd", "agy.bat"] {
+            if bin_dir.join(name).is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 检查指定 `.gemini` 目录是否安装了独立 Gemini CLI。
+///
+/// 参数：`gemini_dir` 为 `.gemini` 目录路径；`has_antigravity_or_agy` 表示本机是否已识别出
+/// Antigravity 客户端或 `agy` CLI（它们同样会创建 `~/.gemini` 父目录）。
+/// 返回值：存在 Gemini CLI 专有配置文件/目录，或在未安装 Antigravity/`agy` 且 `.gemini` 已存在时返回 `true`。
+/// 调用示例：`if gemini_cli_under(&home.join(".gemini"), false) { ... }`
+fn gemini_cli_under(gemini_dir: &Path, has_antigravity_or_agy: bool) -> bool {
+    let markers = [
+        "settings.json",
+        "oauth_creds.json",
+        "google_accounts.json",
+        "installation_id",
+        "extensions",
+        "commands",
+    ];
+    if markers.iter().any(|name| gemini_dir.join(name).exists()) {
+        return true;
+    }
+    !has_antigravity_or_agy && (gemini_dir.is_dir() || gemini_dir.join("GEMINI.md").is_file())
+}
+
+/// 检查宿主机系统级安装目录是否存在 Antigravity 桌面应用或 IDE。
+///
+/// 参数：无。
+/// 返回值：系统级应用目录存在时返回 `true`。
+/// 调用示例：`if system_antigravity_installed() { ... }`
+fn system_antigravity_installed() -> bool {
+    if cfg!(target_os = "macos") {
+        Path::new("/Applications/Antigravity.app").is_dir()
+    } else if cfg!(windows) {
+        for (var, sub) in [
+            ("LOCALAPPDATA", "Programs/Antigravity"),
+            ("LOCALAPPDATA", "Antigravity"),
+            ("ProgramFiles", "Antigravity"),
+            ("APPDATA", "Antigravity"),
+        ] {
+            if env_dir(var)
+                .map(|base| base.join(sub).is_dir())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+        false
+    } else {
+        [
+            "/opt/Antigravity",
+            "/opt/antigravity",
+            "/usr/lib/antigravity",
+            "/usr/share/antigravity",
+        ]
+        .iter()
+        .any(|dir| Path::new(dir).is_dir())
+    }
+}
+
+/// 检查宿主机系统环境 `PATH` 或常见系统级 `bin` 目录中是否安装了 `agy` CLI。
+///
+/// 参数：无。
+/// 返回值：找到可执行的 `agy` 命令时返回 `true`（同时覆盖 launchd/systemd 精简 `PATH` 下的常见目录）。
+/// 调用示例：`if system_agy_cli_installed() { ... }`
+fn system_agy_cli_installed() -> bool {
+    if command_in_path("agy") {
+        return true;
+    }
+    if cfg!(windows) {
+        for (var, sub) in [
+            ("LOCALAPPDATA", "Antigravity/bin"),
+            ("LOCALAPPDATA", "Programs/Antigravity/bin"),
+            ("ProgramFiles", "Antigravity/bin"),
+        ] {
+            if let Some(dir) = env_dir(var).map(|base| base.join(sub)) {
+                if ["agy.exe", "agy.cmd", "agy.bat"]
+                    .iter()
+                    .any(|name| dir.join(name).is_file())
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    } else {
+        ["/opt/homebrew/bin/agy", "/usr/local/bin/agy"]
+            .iter()
+            .any(|path| is_executable_file(Path::new(path)))
+    }
+}
+
+/// 在当前进程的 `PATH` 环境变量中查找指定命令是否存在。
+///
+/// 参数：`cmd` 为不含扩展名的命令名（如 `"agy"`）。
+/// 返回值：在任一 `PATH` 目录中找到对应可执行文件时返回 `true`。
+/// 调用示例：`if command_in_path("agy") { ... }`
+fn command_in_path(cmd: &str) -> bool {
+    let Some(raw_path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&raw_path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        if cfg!(windows) {
+            for ext in ["exe", "cmd", "bat"] {
+                if dir.join(format!("{cmd}.{ext}")).is_file() {
+                    return true;
+                }
+            }
+        } else if is_executable_file(&dir.join(cmd)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 判断 `path` 是否为普通可执行文件（Windows 下退化为存在的文件判断）。
+///
+/// 参数：`path` 为待检查的文件路径。
+/// 返回值：Unix 下为普通文件且带有任一执行权限位（`0o111`）时返回 `true`；非 Unix 下为普通文件即返回 `true`。
+/// 调用示例：`if is_executable_file(&bin_path) { ... }`
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .map(|meta| meta.is_file() && (meta.permissions().mode() & 0o111 != 0))
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
 fn env_dir(name: &str) -> Option<PathBuf> {
     let value = std::env::var_os(name)?;
     let value = value.to_string_lossy();
@@ -571,6 +998,7 @@ fn push_unique(
             id,
             path,
             import: None,
+            also_covers: Vec::new(),
         });
     }
 }
@@ -782,6 +1210,8 @@ fn apply_plan(config: &SyncConfig, plan: Plan, content: &[u8], data_dir: &Path) 
             Some(target) => import_body(target),
             None => content.to_vec(),
         };
+        // 报告中使用带共享客户端的紧凑标识（如 `antigravity+agy`），备份库仍记录主 `id`。
+        let label = adapter.label();
         match write_one(
             &adapter.id,
             &adapter.path,
@@ -791,14 +1221,14 @@ fn apply_plan(config: &SyncConfig, plan: Plan, content: &[u8], data_dir: &Path) 
             config.keep_backups,
         ) {
             Ok(WriteOutcome::Written(backup)) => {
-                report.written.push((adapter.id, adapter.path, backup));
+                report.written.push((label, adapter.path, backup));
             }
             Ok(WriteOutcome::Unchanged) => {
-                report.unchanged.push((adapter.id, adapter.path));
+                report.unchanged.push((label, adapter.path));
             }
             Err(err) => report
                 .failed
-                .push((adapter.id, adapter.path, format!("{err:#}"))),
+                .push((label, adapter.path, format!("{err:#}"))),
         }
     }
     // 有写入失败时先不移旧副本：旧位置可能是某个引擎此刻唯一能读到的 prompt。
@@ -1421,5 +1851,208 @@ mod tests {
         }
         let chosen = cindy_prompt_under(&root).unwrap();
         assert_eq!(chosen, root.join("acme/bots/cindy-default/SOUL.md"));
+    }
+
+    /// 单独安装 Antigravity 客户端（含已运行数据目录与全新安装应用包但尚未创建 `.gemini` 两种情形）。
+    #[test]
+    fn detects_antigravity_client_surfaces_and_fresh_app_install() {
+        let config = SyncConfig::default();
+
+        // 1. 全新安装系统级 Antigravity.app，`~/.gemini` 目录还不存在时也能检测并写入。
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let external = ExternalClients {
+            antigravity_app: true,
+            ..ExternalClients::default()
+        };
+        let plan = plan_with_probes(&config, &home, None, None, &external, || false);
+        assert_eq!(plan.adapters.len(), 1);
+        assert_eq!(plan.adapters[0].id, "antigravity");
+        assert_eq!(plan.adapters[0].path, home.join(".gemini/GEMINI.md"));
+        assert!(plan.adapters[0].also_covers.is_empty());
+
+        let report = apply_plan(&config, plan, b"global prompt\n", &state_dir(&home));
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert_eq!(
+            fs::read_to_string(home.join(".gemini/GEMINI.md")).unwrap(),
+            "global prompt\n"
+        );
+
+        // 2. 各平台家目录下的 Antigravity 2.0 / IDE / SSH 远端 / Linux XDG 目录。
+        for rel in [
+            ".gemini/antigravity",
+            ".gemini/antigravity-ide",
+            ".gemini/config",
+            ".antigravity-server",
+            "Library/Application Support/Antigravity",
+            ".config/Antigravity",
+        ] {
+            let case = tempfile::tempdir().unwrap();
+            let case_home = case.path().join("home");
+            fs::create_dir_all(case_home.join(rel)).unwrap();
+            let plan = plan_with_roots(&config, &case_home, None, None, || false);
+            let adapter = plan
+                .adapters
+                .iter()
+                .find(|item| item.id == "antigravity")
+                .unwrap_or_else(|| panic!("missing antigravity for {rel}: {:?}", plan.adapters));
+            assert_eq!(adapter.path, case_home.join(".gemini/GEMINI.md"));
+            assert!(
+                !plan.adapters.iter().any(|item| item.id == "gemini"),
+                "must not double-write or mislabel as gemini for {rel}"
+            );
+        }
+    }
+
+    /// 单独安装 `agy` CLI（配置目录、独立目录、`~/.local/bin/agy` 或系统 `PATH`）。
+    #[test]
+    fn detects_agy_cli_from_dirs_local_bin_and_system_path() {
+        let config = SyncConfig::default();
+
+        // 1. `~/.gemini/antigravity-cli`、`~/.antigravity`、`~/.agy` 目录检测。
+        for rel in [".gemini/antigravity-cli", ".antigravity", ".agy"] {
+            let case = tempfile::tempdir().unwrap();
+            let home = case.path().join("home");
+            fs::create_dir_all(home.join(rel)).unwrap();
+            let plan = plan_with_roots(&config, &home, None, None, || false);
+            assert_eq!(plan.adapters.len(), 1, "rel={rel}");
+            assert_eq!(plan.adapters[0].id, "agy", "rel={rel}");
+            assert_eq!(plan.adapters[0].path, home.join(".gemini/GEMINI.md"));
+            assert!(plan.adapters[0].also_covers.is_empty());
+        }
+
+        // 2. 刚运行完官方 install.sh（只有 `~/.local/bin/agy`，还没有 `~/.gemini`）。
+        let local_case = tempfile::tempdir().unwrap();
+        let local_home = local_case.path().join("home");
+        let bin = local_home.join(".local/bin/agy");
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plan = plan_with_roots(&config, &local_home, None, None, || false);
+        assert_eq!(plan.adapters.len(), 1);
+        assert_eq!(plan.adapters[0].id, "agy");
+        assert_eq!(plan.adapters[0].path, local_home.join(".gemini/GEMINI.md"));
+
+        // 3. 系统级 `PATH` 中检测到 `agy`。
+        let path_case = tempfile::tempdir().unwrap();
+        let path_home = path_case.path().join("home");
+        fs::create_dir_all(&path_home).unwrap();
+        let external = ExternalClients {
+            agy_cli: true,
+            ..ExternalClients::default()
+        };
+        let plan = plan_with_probes(&config, &path_home, None, None, &external, || false);
+        assert_eq!(plan.adapters.len(), 1);
+        assert_eq!(plan.adapters[0].id, "agy");
+    }
+
+    /// Antigravity 客户端、`agy` CLI 与 Gemini CLI 同时存在时共用同一个 `~/.gemini/GEMINI.md`，
+    /// 只写一次，且把同目录下会叠加加载的同步旧副本归档移走、用户手写规则保留。
+    #[test]
+    fn antigravity_and_agy_share_one_file_and_retire_duplicate_global_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(home.join(".gemini/antigravity")).unwrap();
+        fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+        fs::create_dir_all(home.join(".gemini/config")).unwrap();
+        fs::write(home.join(".gemini/settings.json"), "{}\n").unwrap();
+
+        // 旧版同步副本落在 `~/.gemini/AGENTS.md`（应被归档移走）；
+        // 用户手写规则落在 `~/.gemini/config/AGENTS.md`（应原样保留并提示）。
+        fs::write(home.join(".gemini/GEMINI.md"), "old synced\n").unwrap();
+        fs::write(home.join(".gemini/AGENTS.md"), "old synced\n").unwrap();
+        fs::write(home.join(".gemini/config/AGENTS.md"), "my custom rule\n").unwrap();
+
+        let config = SyncConfig::default();
+        let plan = plan_with_roots(&config, &home, None, None, || false);
+        assert_eq!(
+            plan.adapters.len(),
+            1,
+            "shared engine must write only one file"
+        );
+        let adapter = &plan.adapters[0];
+        assert_eq!(adapter.id, "antigravity");
+        assert_eq!(adapter.also_covers, vec!["agy", "gemini"]);
+        assert_eq!(adapter.label(), "antigravity+agy+gemini");
+        assert_eq!(adapter.path, home.join(".gemini/GEMINI.md"));
+
+        let report = apply_plan(&config, plan, b"new synced\n", &state_dir(&home));
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert_eq!(report.written[0].0, "antigravity+agy+gemini");
+        assert!(report.summary().contains("antigravity+agy+gemini"));
+        assert_eq!(
+            fs::read_to_string(home.join(".gemini/GEMINI.md")).unwrap(),
+            "new synced\n"
+        );
+        assert!(
+            !home.join(".gemini/AGENTS.md").exists(),
+            "synced duplicate must be retired"
+        );
+        assert_eq!(
+            fs::read_to_string(home.join(".gemini/config/AGENTS.md")).unwrap(),
+            "my custom rule\n",
+            "user-written rule must stay untouched"
+        );
+        assert_eq!(
+            report.kept,
+            vec![(
+                "antigravity".to_string(),
+                home.join(".gemini/config/AGENTS.md")
+            )]
+        );
+    }
+
+    /// `adapt_exclude` 与独立 `GEMINI_CLI_HOME` 的交互：排除任一共用端时不动 `~/.gemini/GEMINI.md`，
+    /// 独立 `GEMINI_CLI_HOME` 与 `~/.gemini/GEMINI.md` 互不影响。
+    #[test]
+    fn adapt_exclude_and_custom_gemini_cli_home_stay_independent() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let custom_gemini_home = temp.path().join("isolated-gemini");
+        fs::create_dir_all(home.join(".gemini/antigravity")).unwrap();
+        fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+        fs::create_dir_all(custom_gemini_home.join(".gemini")).unwrap();
+
+        let external = ExternalClients {
+            gemini_cli_home: Some(custom_gemini_home.clone()),
+            ..ExternalClients::default()
+        };
+
+        // 1. 默认两处都写入：antigravity(+agy) 写 `~/.gemini/GEMINI.md`，gemini 写独立目录。
+        let plan = plan_with_probes(&SyncConfig::default(), &home, None, None, &external, || {
+            false
+        });
+        assert_eq!(plan.adapters.len(), 2);
+        let ag = plan
+            .adapters
+            .iter()
+            .find(|item| item.id == "antigravity")
+            .unwrap();
+        assert_eq!(ag.also_covers, vec!["agy"]);
+        assert_eq!(ag.path, home.join(".gemini/GEMINI.md"));
+        let gem = plan
+            .adapters
+            .iter()
+            .find(|item| item.id == "gemini")
+            .unwrap();
+        assert_eq!(gem.path, custom_gemini_home.join(".gemini/GEMINI.md"));
+
+        // 2. 排除 `agy`（或 `antigravity`）时，共用的 `~/.gemini/GEMINI.md` 停止写入且不触碰重复副本，
+        //    而独立目录里的 `gemini` 不受影响。
+        for skip in ["agy", "antigravity"] {
+            let cfg = SyncConfig {
+                adapt_exclude: vec![skip.to_string()],
+                ..SyncConfig::default()
+            };
+            let plan = plan_with_probes(&cfg, &home, None, None, &external, || false);
+            let ids: Vec<&str> = plan.adapters.iter().map(|item| item.id.as_str()).collect();
+            assert_eq!(ids, vec!["gemini"], "skip={skip}");
+            assert!(plan.retire.is_empty(), "skip={skip}");
+        }
     }
 }
